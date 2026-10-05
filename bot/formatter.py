@@ -61,6 +61,21 @@ def build_plan(title: str, options: set[str] | tuple[str, ...], script_ids: tupl
     return TestPlan(title, tuple(matrices), tuple(views), sort)
 
 
+def sort_choices(options: set[str] | tuple[str, ...]) -> list[tuple[str, str]]:
+    """结果图可选的排序方式 [(按钮文字, sort 参数)]，空字符串表示订阅原顺序。只有 normalview 支持排序。"""
+    options = set(options)
+    if not options - {"geo"}:
+        return []
+    choices = [("📋 订阅顺序（默认）", ""), ("🀄 节点名（升序）", "name_asc")]
+    if "speed" in options:
+        choices += [("🚀 平均速度（升序）", "avg_speed_asc"), ("🚀 平均速度（降序）", "avg_speed_desc")]
+    if "rtt" in options:
+        choices += [("⏱ 延迟（升序）", "rtt_asc"), ("⏱ 延迟（降序）", "rtt_desc")]
+    if "conn" in options:
+        choices += [("🌐 HTTPS 延迟（升序）", "https_asc")]
+    return choices
+
+
 STATUS_TEXT = {
     "pending": "⏳ 排队中",
     "running": "🏃 测试中",

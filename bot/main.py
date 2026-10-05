@@ -5,7 +5,7 @@ import logging
 import re
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User,
@@ -21,7 +21,7 @@ from .api import APIError, SCPClient
 from .config import Config
 from .formatter import (
     PRESETS, STATUS_TEXT, TEST_OPTIONS, TestPlan, build_plan, esc, format_result_text, format_stats,
-    progress_bar,
+    progress_bar, sort_choices,
 )
 from .subscription import (
     DEFAULT_SUB_LINK_PATTERN, SubscriptionError, contains_sensitive_link, extract_sources, fetch_subscription,
@@ -36,7 +36,7 @@ FINAL_STATUSES = {"completed", "failed", "canceled"}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 SELECTION_TTL = 600  # 测试项选择菜单的有效期（秒）
-BACKENDS_PER_PAGE = 8
+BACKENDS_PER_PAGE = 5
 NOTICE_TTL = 60  # 群内私聊引导消息自动删除时间（秒）
 
 
@@ -70,16 +70,30 @@ class Selection:
     slave_name: str | None = None
     backends: list[dict] = field(default_factory=list)  # 可选后端快照
     backend_page: int = 0
-    quick: str | None = None  # 快捷命令：选完后端直接按该预设开测
+    quick: str | None = None  # 快捷命令：选完后端/排序直接按该预设开测
+    label: str = "临时订阅"  # 任务显示名（订阅名）
+    sort: str | None = None  # 结果排序；None 用预设默认，"" 为订阅原顺序
     scripts: set[str] = field(default_factory=set)
     script_list: list[tuple[str, str]] = field(default_factory=list)
     page: str = "main"
     created: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class TaskView:
+    """已提交任务的展示信息。"""
+    task_id: str
+    label: str  # 任务显示名（订阅名）
+    info: str  # 测试类型、发起人、节点数、任务 ID
+    backend: str  # 选择的后端（自动选择时由任务状态中的 slave_name 覆盖）
+    plan: TestPlan
+
+
 HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 
-<b>使用方式</b>：在群里发送测试命令，点击「私聊发送订阅」按钮，在私聊中发送订阅链接或节点链接。
+<b>使用方式</b>：
+• 已保存的订阅：群里直接发 <code>/speed 订阅名</code>，选择后端和排序后开始（/sub 查看订阅名）
+• 临时订阅：群里发测试命令，点击「私聊发送订阅」按钮，在私聊中发送订阅链接或节点链接
 测试进度和结果会发回群里并 @ 你。为防止泄露，群里出现的订阅链接会被自动删除。
 
 <b>测试命令</b>：
@@ -94,6 +108,7 @@ HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 <code>-s 后端ID或名称</code> 直接指定后端（见 /backends），不指定时会弹出后端选择按钮
 
 <b>其他</b>：
+/sub — 查看可用订阅（管理员私聊 <code>/sub add 名称 链接</code>、<code>/sub del 名称</code>）
 /backends — 后端列表
 /tasks — 最近任务
 /result 任务ID — 重新获取结果图
@@ -194,6 +209,48 @@ class SpeedBot:
             )
         await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
+    async def cmd_sub(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """订阅管理：/sub 列出订阅名；管理员私聊 /sub add 名称 链接、/sub del 名称。"""
+        if not await self.guard(update):
+            return
+        msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+        args = context.args or []
+        action = args[0].lower() if args else "list"
+        if action in ("add", "del", "rm") and not self.is_admin(user.id):
+            await msg.reply_text("只有管理员可以管理订阅。")
+            return
+        try:
+            if action == "add":
+                if chat.type != ChatType.PRIVATE:
+                    await self._delete(msg)
+                    await msg.chat.send_message("请私聊 Bot 添加订阅，避免订阅链接泄露。")
+                    return
+                if len(args) < 3 or not re.fullmatch(r"[^ \t]{1,16}", args[1]):
+                    await msg.reply_text("用法：/sub add 名称 订阅链接（名称 1-16 个字符，不含空格）")
+                    return
+                await self.api.create_profile(args[1], args[2])
+                await msg.reply_text(f"已添加订阅「{esc(args[1])}」，群里发送 <code>/speed {esc(args[1])}</code> 即可测试。",
+                                     parse_mode=ParseMode.HTML)
+                return
+            if action in ("del", "rm"):
+                profile = await self._find_profile(args[1]) if len(args) > 1 else None
+                if not profile:
+                    await msg.reply_text("用法：/sub del 名称（名称需存在）")
+                    return
+                await self.api.delete_profile(profile["uuid"])
+                await msg.reply_text(f"已删除订阅「{esc(profile.get('name'))}」。")
+                return
+            profiles = [p for p in await self.api.list_profiles() if p.get("is_active", True)]
+        except APIError as e:
+            await msg.reply_text(f"操作失败：{esc(e)}")
+            return
+        if not profiles:
+            await msg.reply_text("还没有保存的订阅。管理员可私聊发送 <code>/sub add 名称 订阅链接</code> 添加。",
+                                 parse_mode=ParseMode.HTML)
+            return
+        names = "\n".join(f"• <code>{esc(p.get('name'))}</code>" for p in profiles)
+        await msg.reply_text(f"<b>可用订阅</b>\n{names}\n\n用法：<code>/speed 订阅名</code>", parse_mode=ParseMode.HTML)
+
     async def cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.guard(update):
             return
@@ -278,7 +335,20 @@ class SpeedBot:
             return
         if not await self.guard(update):
             return
-        # 群里不接收订阅，引导发起人私聊提交，结果再发回本群
+        rest, name_filter, slave = self._parse_args(context.args or [])
+        if rest and not any(extract_sources(msg.text or "")):
+            # 群里只接受已保存的订阅名，例如 /speed 3399
+            profile = await self._find_profile(rest[0])
+            if profile:
+                subs, uris = extract_sources(profile.get("url") or "")
+                await self._start_test(msg, update.effective_user, chat.id, chat.title or "", command, subs, uris,
+                                       name_filter, slave, profile.get("name") or rest[0], context.application)
+                return
+            await msg.reply_text(f"未找到订阅「{esc(rest[0])}」，发送 /sub 查看可用订阅；临时订阅请私聊发送。",
+                                 parse_mode=ParseMode.HTML,
+                                 reply_markup=self._dm_markup(context.bot.username, chat.id, command))
+            return
+        # 群里不接收订阅链接，引导发起人私聊提交，结果再发回本群
         deleted = False
         if self.cfg.delete_sub_message and any(extract_sources(msg.text or "")):
             deleted = await self._delete(msg)
@@ -395,6 +465,16 @@ class SpeedBot:
             return DMTarget(user.id, "私聊", "test")
         return None
 
+    async def _find_profile(self, name: str) -> dict | None:
+        """按名称查找 SpeedCentre+ 账号里保存的订阅（先精确匹配，再忽略大小写）。"""
+        try:
+            profiles = [p for p in await self.api.list_profiles() if p.get("is_active", True)]
+        except APIError as e:
+            log.warning("获取订阅列表失败：%s", e)
+            return None
+        exact = next((p for p in profiles if p.get("name") == name), None)
+        return exact or next((p for p in profiles if (p.get("name") or "").lower() == name.lower()), None)
+
     async def _private_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                             command: str, args: list[str]) -> None:
         msg, user = update.effective_message, update.effective_user
@@ -403,29 +483,43 @@ class SpeedBot:
             await msg.reply_text("请先在授权群里发送 /test，然后点击「私聊发送订阅」按钮。")
             return
         target.touch()
-        preset = PRESETS[command]
         rest, name_filter, slave = self._parse_args(args)
 
         subs, uris = extract_sources(" ".join(rest))
         if not subs and not uris and msg.reply_to_message:
             reply = msg.reply_to_message
             subs, uris = extract_sources(reply.text or reply.caption or "")
+        label = "临时订阅"
+        if not subs and not uris and rest:
+            profile = await self._find_profile(rest[0])
+            if not profile:
+                await msg.reply_text(f"未找到订阅「{esc(rest[0])}」，发送 /sub 查看可用订阅。", parse_mode=ParseMode.HTML)
+                return
+            subs, uris = extract_sources(profile.get("url") or "")
+            label = profile.get("name") or rest[0]
         if not subs and not uris:
-            await msg.reply_text(f"请提供订阅链接或节点链接，例如：\n<code>/{preset.command} https://example.com/sub</code>",
+            await msg.reply_text(f"请提供订阅名、订阅链接或节点链接，例如：\n<code>/{command} https://example.com/sub</code>",
                                  parse_mode=ParseMode.HTML)
             return
+        await self._start_test(msg, user, target.chat_id, target.title, command, subs, uris, name_filter, slave,
+                               label, context.application)
+
+    async def _start_test(self, msg: Message, user: User, chat_id: int, chat_title: str, command: str,
+                          subs: list[str], uris: list[str], name_filter: str | None, slave: str | None,
+                          label: str, application: Application) -> None:
+        """解析节点，然后进入后端/排序/测试项选择，最后提交。选择菜单在 msg 所在会话中显示。"""
+        preset = PRESETS[command]
         if name_filter:
             try:
                 re.compile(name_filter)
             except re.error:
                 await msg.reply_text("过滤正则无效。")
                 return
-
-        if self._busy(target.chat_id):
-            await msg.reply_text("目标群已有任务在运行，请等待完成后再试。")
+        if self._busy(chat_id):
+            await msg.reply_text("本群已有任务在运行，请等待完成后再试。")
             return
 
-        status = await msg.reply_text("📥 正在解析节点…")
+        status = await msg.reply_text(f"📥 任务 <b>{esc(label)}</b> 正在解析节点…", parse_mode=ParseMode.HTML)
         proxies: list[dict] = []
         errors: list[str] = []
         for uri in uris:
@@ -460,22 +554,28 @@ class SpeedBot:
             chosen = self._match_backend(backends, self.cfg.default_slave_id)
 
         sel = Selection(
-            owner=user, chat_id=target.chat_id, target_title=target.title, status=status, nodes=nodes,
+            owner=user, chat_id=chat_id, target_title=chat_title, status=status, nodes=nodes,
             skipped=skipped, name_filter=name_filter, slave=chosen and chosen["client_id"],
             slave_name=chosen and chosen.get("display_name"), options=set(preset.options), backends=backends,
+            label=label,
         )
-        ask_backend = self.cfg.backend_select and not slave and len(backends) > 1
-        if command != "test" and not ask_backend:
-            # 快捷命令直接按预设开测
-            await self._submit(sel, build_plan(preset.title, preset.options), context.application)
-            return
         if command != "test":
-            # 快捷命令：先选后端，点击后立即开测
-            sel.quick, sel.page = command, "backends"
+            # 快捷命令：按需先选后端、再选排序，然后直接开测
+            sel.quick = command
+            if self.cfg.backend_select and not slave and len(backends) > 1:
+                sel.page = "backends"
+            elif self._ask_sort(sel):
+                sel.page = "sort"
+            else:
+                await self._submit(sel, build_plan(preset.title, preset.options), application)
+                return
         self._purge_selections()
         sid = secrets.token_hex(4)
         self.selections[sid] = sel
         await self._render_menu(sid, sel)
+
+    def _ask_sort(self, sel: "Selection") -> bool:
+        return self.cfg.sort_select and bool(sort_choices(sel.options))
 
     # ------------------------------------------------------------ 测试项选择菜单
 
@@ -514,10 +614,8 @@ class SpeedBot:
         return not self.cfg.allowed_backends or b.get("client_id") in self.cfg.allowed_backends
 
     async def _selectable_backends(self) -> list[dict]:
-        """用户可以选择的后端：在线、允许 Copilot 调用、在 ALLOWED_BACKENDS 内，按排队数排序。"""
-        backends = [b for b in await self._all_backends() if b.get("is_online") and self._backend_allowed(b)]
-        return sorted(backends, key=lambda b: (b.get("speed_pending", 0) + b.get("conn_pending", 0),
-                                               b.get("display_name") or ""))
+        """用户可以选择的后端：在线、允许 Copilot 调用、在 ALLOWED_BACKENDS 内，保持 API 返回的顺序。"""
+        return [b for b in await self._all_backends() if b.get("is_online") and self._backend_allowed(b)]
 
     @staticmethod
     def _match_backend(backends: list[dict], key: str) -> dict | None:
@@ -530,8 +628,8 @@ class SpeedBot:
 
     @staticmethod
     def _backend_label(b: dict) -> str:
-        pending = b.get("speed_pending", 0) + b.get("conn_pending", 0)
-        return f"{b.get('display_name') or b.get('client_id')} · 排队 {pending}"
+        name, cid = b.get("display_name") or b.get("client_id"), b.get("client_id")
+        return name if name == cid else f"{name} ({cid})"
 
     @staticmethod
     def _sel_header(sel: "Selection") -> str:
@@ -546,34 +644,45 @@ class SpeedBot:
     async def _render_menu(self, sid: str, sel: "Selection") -> None:
         chosen = [TEST_OPTIONS[k][0] for k in TEST_OPTIONS if k in sel.options]
         chosen += [name for i, name in sel.script_list if i in sel.scripts]
-        text = (f"<b>选择测试项目</b> · {sel.owner.mention_html()}\n{self._sel_header(sel)}\n\n"
+        text = (f"<b>选择测试项目</b> · {sel.owner.mention_html()}\n任务：<b>{esc(sel.label)}</b>\n{self._sel_header(sel)}\n\n"
                 f"已选：{esc('、'.join(chosen)) if chosen else '（未选择）'}")
 
         def btn(label: str, action: str) -> InlineKeyboardButton:
             return InlineKeyboardButton(label, callback_data=f"sel:{sid}:{action}")
 
         rows: list[list[InlineKeyboardButton]] = []
+        title = PRESETS[sel.quick].title if sel.quick else "测试"
+        stop = btn("❌ 终止操作", "x") if sel.quick else btn("◂ 返回", "main")
         if sel.page == "backends":
-            title = PRESETS[sel.quick].title if sel.quick else "测试"
-            text = (f"<b>选择{esc(title)}后端</b> · {sel.owner.mention_html()}\n{self._sel_header(sel)}\n\n"
-                    + ("点击后端立即开始测试。" if sel.quick else "选择后端后返回菜单。"))
+            text = (f"🖥 <b>选择{esc(title)}后端</b> · {sel.owner.mention_html()}\n\n"
+                    f"任务：<b>{esc(sel.label)}</b>\n{self._sel_header(sel)}")
             pages = max(1, -(-len(sel.backends) // BACKENDS_PER_PAGE))
             sel.backend_page = min(sel.backend_page, pages - 1)
             start = sel.backend_page * BACKENDS_PER_PAGE
             mark = lambda on: "✅ " if on else ""  # noqa: E731
-            rows.append([btn(mark(sel.slave is None) + "🤖 自动选择（推荐）", "b:auto")])
+            if sel.backend_page == 0:
+                rows.append([btn(mark(sel.slave is None) + "🤖 自动选择", "b:auto")])
             for n, b in enumerate(sel.backends[start:start + BACKENDS_PER_PAGE], start):
-                rows.append([btn(mark(sel.slave == b.get("client_id")) + "🟢 " + self._backend_label(b)[:40], f"b:{n}")])
+                rows.append([btn(mark(sel.slave == b.get("client_id")) + self._backend_label(b)[:48], f"b:{n}")])
             if pages > 1:
-                nav = []
-                if sel.backend_page > 0:
-                    nav.append(btn("◂ 上一页", f"bp:{sel.backend_page - 1}"))
-                nav.append(btn(f"{sel.backend_page + 1}/{pages}", "noop"))
-                if sel.backend_page < pages - 1:
-                    nav.append(btn("下一页 ▸", f"bp:{sel.backend_page + 1}"))
-                rows.append(nav)
-            rows.append([btn("✖️ 取消", "x")] if sel.quick else [btn("◂ 返回", "main")])
+                rows.append([
+                    btn("上一页", f"bp:{sel.backend_page - 1}") if sel.backend_page > 0 else btn("·", "noop"),
+                    btn(f"{sel.backend_page + 1}/{pages}", "noop"),
+                    btn("下一页", f"bp:{sel.backend_page + 1}") if sel.backend_page < pages - 1 else btn("·", "noop"),
+                ])
+            rows.append([stop])
             await self._edit(sel.status, text, InlineKeyboardMarkup(rows))
+            return
+        if sel.page == "sort":
+            text = (f"📊 <b>选择排序方式</b> · {sel.owner.mention_html()}\n\n"
+                    f"订阅名：<b>{esc(sel.label)}</b>\n选中后端：<b>{esc(sel.slave or '自动选择')}</b>")
+            choices = sort_choices(sel.options)
+            buttons = [btn(("✅ " if sel.sort == value and not sel.quick else "") + label, f"o:{n}")
+                       for n, (label, value) in enumerate(choices)]
+            rows += [buttons[:1], buttons[1:2]]
+            rows += [buttons[i:i + 2] for i in range(2, len(buttons), 2)]
+            rows.append([stop])
+            await self._edit(sel.status, text, InlineKeyboardMarkup([r for r in rows if r]))
             return
         if sel.page == "scripts":
             toggles = [btn(("✅ " if i in sel.scripts else "⬜ ") + name[:20], f"s:{n}")
@@ -587,7 +696,11 @@ class SpeedBot:
             rows += [toggles[i:i + 2] for i in range(0, len(toggles), 2)]
             rows.append([btn(f"🎬 流媒体解锁（已选 {len(sel.scripts)}）▸", "scripts")])
             rows.append([btn(f"🖥 后端：{(sel.slave_name or sel.slave or '自动选择')[:24]} ▸", "backends")])
-        rows.append([btn("▶️ 开始测试", "go"), btn("✖️ 取消", "x")])
+            choices = dict((v, k) for k, v in sort_choices(sel.options))
+            if self.cfg.sort_select and choices:
+                current = choices.get(sel.sort, "默认") if sel.sort is not None else "默认"
+                rows.append([btn(f"📊 排序：{current.split(' ', 1)[-1]} ▸", "sort")])
+        rows.append([btn("▶️ 开始测试", "go"), btn("❌ 终止操作", "x")])
         await self._edit(sel.status, text, InlineKeyboardMarkup(rows))
 
     async def _on_select(self, q, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -631,14 +744,23 @@ class SpeedBot:
             else:
                 await q.answer()
                 return
+            if sel.quick and self._ask_sort(sel):
+                sel.page = "sort"
+            elif sel.quick:
+                await self._quick_submit(sid, sel, q, context)
+                return
+            else:
+                sel.page = "main"
+        elif kind == "sort":
+            sel.page = "sort"
+        elif kind == "o":
+            choices = sort_choices(sel.options)
+            if not (arg.isdigit() and int(arg) < len(choices)):
+                await q.answer()
+                return
+            sel.sort = choices[int(arg)][1]
             if sel.quick:
-                if self._busy(sel.chat_id):
-                    await q.answer("本群已有任务在运行，请等待完成后再试。", show_alert=True)
-                    return
-                self.selections.pop(sid, None)
-                await q.answer("正在提交…")
-                preset = PRESETS[sel.quick]
-                await self._submit(sel, build_plan(preset.title, preset.options), context.application)
+                await self._quick_submit(sid, sel, q, context)
                 return
             sel.page = "main"
         elif kind == "s" and arg.isdigit() and int(arg) < len(sel.script_list):
@@ -650,7 +772,7 @@ class SpeedBot:
         elif kind == "x":
             self.selections.pop(sid, None)
             await q.answer()
-            await self._edit(sel.status, "已取消。")
+            await self._edit(sel.status, f"❌ 任务 <b>{esc(sel.label)}</b> 已终止。")
             return
         elif kind == "go":
             if not sel.options and not sel.scripts:
@@ -668,16 +790,27 @@ class SpeedBot:
         await q.answer()
         await self._render_menu(sid, sel)
 
+    async def _quick_submit(self, sid: str, sel: "Selection", q, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if self._busy(sel.chat_id):
+            await q.answer("本群已有任务在运行，请等待完成后再试。", show_alert=True)
+            return
+        self.selections.pop(sid, None)
+        await q.answer("正在提交…")
+        preset = PRESETS[sel.quick]
+        await self._submit(sel, build_plan(preset.title, preset.options), context.application)
+
     # ------------------------------------------------------------ 提交与跟踪
 
     async def _submit(self, sel: "Selection", plan: TestPlan, application: Application) -> None:
         user, status = sel.owner, sel.status
-        await self._edit(status, f"🚀 正在提交任务…\n{self._sel_header(sel)}")
-        task_name = f"TG {plan.title} · {user.full_name}"[:128]
+        if sel.sort is not None:
+            plan = replace(plan, sort=sel.sort or None)
+        await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
+        task_name = f"{sel.label} · {plan.title} · {user.full_name}"[:128]
         try:
             data = await self.api.submit_task(task_name, sel.nodes, list(plan.matrices), slave_id=sel.slave)
         except APIError as e:
-            await self._edit(status, f"❌ 提交任务失败：{esc(e)}")
+            await self._edit(status, f"❌ 任务 <b>{esc(sel.label)}</b> 提交失败：{esc(e)}")
             return
         task_id = (data or {}).get("task_id")
         if not task_id:
@@ -686,21 +819,26 @@ class SpeedBot:
 
         self.running.setdefault(sel.chat_id, set()).add(task_id)
         self.owners[task_id] = user.id
-        header = f"<b>{esc(plan.title)}</b> · {user.mention_html()}\n任务 <code>{task_id}</code>\n{self._sel_header(sel)}"
+        info = f"{esc(plan.title)} · {user.mention_html()}\n节点 {len(sel.nodes)} 个"
+        if sel.skipped:
+            info += f"（跳过 {sel.skipped} 个）"
+        if sel.name_filter:
+            info += f" · 过滤 <code>{esc(sel.name_filter)}</code>"
+        info += f"\nID <code>{task_id}</code>"
+        watch = TaskView(task_id, sel.label, info, sel.slave_name or sel.slave or "自动选择", plan)
         if sel.chat_id != status.chat_id:
             # 私聊提交，进度和结果发到群里并 @ 发起人
-            await self._edit(status, f"✅ 已提交，进度和结果将发送到群「{esc(sel.target_title)}」。\n"
-                                     f"任务 <code>{task_id}</code>")
+            await self._edit(status, f"✅ 任务 <b>{esc(sel.label)}</b> 已提交，进度和结果将发送到群「{esc(sel.target_title)}」。")
             try:
-                status = await application.bot.send_message(sel.chat_id, f"{header}\n\n⏳ 排队中",
+                status = await application.bot.send_message(sel.chat_id, self._task_text(watch, "pending"),
                                                             parse_mode=ParseMode.HTML)
             except TelegramError as e:
                 log.warning("向群 %s 发送任务消息失败：%s", sel.chat_id, e)
-                await self._edit(sel.status, f"⚠️ 无法在群里发送消息（{esc(e)}），结果改为发到这里。\n任务 <code>{task_id}</code>")
+                await self._edit(sel.status, f"⚠️ 无法在群里发送消息（{esc(e)}），结果改为发到这里。")
                 status = sel.status
         log.info("chat=%s user=%s 提交任务 %s（%d 节点，%d 矩阵）",
                  sel.chat_id, user.id, task_id, len(sel.nodes), len(plan.matrices))
-        application.create_task(self._watch(status, task_id, plan, header, sel.chat_id), name=f"watch-{task_id}")
+        application.create_task(self._watch(status, watch, sel.chat_id), name=f"watch-{task_id}")
 
     async def _edit(self, msg: Message, text: str, markup=None) -> None:
         try:
@@ -712,36 +850,72 @@ class SpeedBot:
         except TelegramError as e:
             log.warning("编辑消息失败：%s", e)
 
-    async def _watch(self, status: Message, task_id: str, plan: TestPlan, header: str, chat_id: int) -> None:
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("取消任务", callback_data=f"cancel:{task_id}")]])
+    @staticmethod
+    def _task_text(v: "TaskView", status: str, done: int = 0, total: int = 0, backend: str | None = None,
+                   extra: str = "") -> str:
+        label = esc(v.label)
+        head = {
+            "pending": f"⏳ 任务 <b>{label}</b> 准备中…",
+            "running": f"⚡ 任务 <b>{label}</b> 进行中…",
+            "completed": f"✅ 任务 <b>{label}</b> 已完成",
+            "failed": f"❌ 任务 <b>{label}</b> 失败",
+            "canceled": f"🚫 任务 <b>{label}</b> 已取消",
+        }.get(status, f"❔ 任务 <b>{label}</b> {esc(status)}")
+        if status == "running":
+            pct = int(100 * done / total) if total else 0
+            head += f"\n<code>[{progress_bar(done, total, 16)}]</code> {pct}%  {done}/{total}"
+        if extra:
+            head += f"\n{extra}"
+        return f"{head}\n\n{v.info}\n后端 {esc(backend or v.backend)}"
+
+    def _task_url(self, task_id: str) -> str | None:
+        return self.cfg.task_url.replace("{task_id}", task_id) if self.cfg.task_url else None
+
+    async def _share_markup(self, v: "TaskView") -> InlineKeyboardMarkup | None:
+        """创建公开分享并返回「查看详情」按钮；未配置 SCP_SHARE_URL 时退回网页任务链接。"""
+        url = None
+        if self.cfg.share_url:
+            try:
+                share = await self.api.create_share(v.task_id, v.label)
+                if share and share.get("uuid"):
+                    url = self.cfg.share_url.replace("{uuid}", share["uuid"])
+            except APIError as e:
+                log.info("创建任务 %s 的分享失败：%s", v.task_id, e)
+        url = url or self._task_url(v.task_id)
+        return InlineKeyboardMarkup([[InlineKeyboardButton("📊 查看详情", url=url)]]) if url else None
+
+    async def _watch(self, status: Message, v: "TaskView", chat_id: int) -> None:
+        rows = [[InlineKeyboardButton("❌ 取消任务", callback_data=f"cancel:{v.task_id}")]]
+        if self._task_url(v.task_id):
+            rows.append([InlineKeyboardButton("📊 在 SpeedCentre+ 查看", url=self._task_url(v.task_id))])
+        keyboard = InlineKeyboardMarkup(rows)
         started = time.monotonic()
         last_text = ""
         task: dict = {}
         try:
             while True:
                 try:
-                    task = await self.api.get_task(task_id)
+                    task = await self.api.get_task(v.task_id)
                 except APIError as e:
-                    log.warning("查询任务 %s 失败：%s", task_id, e)
+                    log.warning("查询任务 %s 失败：%s", v.task_id, e)
                     task = task or {}
                 st = task.get("status", "pending")
                 if st in FINAL_STATUSES:
                     break
                 if time.monotonic() - started > self.cfg.task_timeout:
-                    await self._edit(status, f"{header}\n\n⌛ 等待超时，可稍后使用 /result {task_id} 查看结果。")
+                    await self._edit(status, self._task_text(
+                        v, st, extra=f"⌛ 等待超时，可稍后使用 /result {v.task_id} 查看结果。"))
                     return
 
                 done, total = task.get("completed_nodes", 0), task.get("node_count", 0)
                 if st == "running":
                     try:
-                        prog = await self.api.get_progress(task_id)
+                        prog = await self.api.get_progress(v.task_id)
                         done, total = prog.get("completed_count", done), prog.get("total_count", total)
                     except APIError:
                         pass
-                line = f"{STATUS_TEXT.get(st, st)}"
-                if task.get("slave_name"):
-                    line += f" · 后端 {esc(task['slave_name'])}"
-                text = f"{header}\n\n{line}\n<code>{progress_bar(done, total)}</code> {done}/{total}"
+                text = self._task_text(v, "running" if st == "running" else "pending", done, total,
+                                       task.get("slave_name"))
                 if text != last_text:
                     await self._edit(status, text, keyboard)
                     last_text = text
@@ -753,20 +927,22 @@ class SpeedBot:
                 extra.append(f"耗时 {task['duration_ms'] / 1000:.0f}s")
             if task.get("credit_cost") is not None:
                 extra.append(f"消耗 {task['credit_cost']} 积分")
-            summary = f"{header}\n\n{STATUS_TEXT.get(st, st)}" + (f" · {' · '.join(extra)}" if extra else "")
             if st == "failed" and task.get("error_msg"):
-                summary += f"\n原因：{esc(task['error_msg'])}"
+                extra.append(f"原因：{esc(task['error_msg'])}")
+            summary = self._task_text(v, st, backend=task.get("slave_name"), extra=" · ".join(extra))
             await self._edit(status, summary)
             if st == "completed":
-                await self._send_result(status, task_id, plan.views, plan.sort, header)
+                await self._send_result(status, v.task_id, v.plan.views, v.plan.sort, summary,
+                                        await self._share_markup(v))
         except Exception:
-            log.exception("跟踪任务 %s 出错", task_id)
-            await self._edit(status, f"{header}\n\n⚠️ 跟踪任务时出错，可使用 /result {task_id} 查看结果。")
+            log.exception("跟踪任务 %s 出错", v.task_id)
+            await self._edit(status, self._task_text(
+                v, "unknown", extra=f"⚠️ 跟踪任务时出错，可使用 /result {v.task_id} 查看结果。"))
         finally:
-            self.running.get(chat_id, set()).discard(task_id)
+            self.running.get(chat_id, set()).discard(v.task_id)
 
     async def _send_result(self, reply_to: Message, task_id: str, views: tuple[str, ...],
-                           sort: str | None, header: str) -> None:
+                           sort: str | None, header: str, markup: InlineKeyboardMarkup | None = None) -> None:
         entries: list[dict] = []
         try:
             result = await self.api.get_result(task_id)
@@ -786,25 +962,28 @@ class SpeedBot:
                 log.info("导出任务 %s 的 %s 失败：%s", task_id, view, e)
                 continue
             # 多张图时只在第一张附带说明
-            cap = caption if not sent else None
+            cap, mk = (caption, markup) if not sent else (None, None)
             try:
-                await reply_to.reply_photo(io.BytesIO(image), caption=cap, parse_mode=ParseMode.HTML)
+                await reply_to.reply_photo(io.BytesIO(image), caption=cap, parse_mode=ParseMode.HTML, reply_markup=mk)
             except BadRequest as e:
                 # 节点多时图片过长，Telegram 不接受为 photo，改为文件发送
                 log.info("以图片发送失败（%s），改为文件发送", e)
                 await reply_to.reply_document(io.BytesIO(image), filename=f"{task_id}-{view}.png",
-                                              caption=cap, parse_mode=ParseMode.HTML)
+                                              caption=cap, parse_mode=ParseMode.HTML, reply_markup=mk)
             sent = True
         if sent:
             return
 
         if not entries:
-            await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML)
+            await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML, reply_markup=markup)
             return
         text = f"{caption}\n\n{format_result_text(entries)}"
         # 按行切分，避免截断 HTML 标签
-        for chunk in _split(text, 4000):
-            await reply_to.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        chunks = _split(text, 4000)
+        for i, chunk in enumerate(chunks):
+            await reply_to.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                                      reply_markup=markup if i == len(chunks) - 1 else None)
+
 
 def _split(text: str, size: int) -> list[str]:
     chunks, cur = [], ""
@@ -825,6 +1004,7 @@ async def _post_init(app: Application) -> None:
         BotCommand("ping", "延迟测试"),
         BotCommand("udp", "UDP 类型测试"),
         BotCommand("topo", "拓扑分析"),
+        BotCommand("sub", "查看可用订阅"),
         BotCommand("backends", "后端列表"),
         BotCommand("tasks", "最近任务"),
         BotCommand("result", "获取任务结果"),
@@ -851,6 +1031,7 @@ def main() -> None:
     app.add_handler(CommandHandler("id", bot.cmd_id))
     app.add_handler(CommandHandler(list(PRESETS), bot.cmd_test))
     app.add_handler(CommandHandler("backends", bot.cmd_backends))
+    app.add_handler(CommandHandler("sub", bot.cmd_sub))
     app.add_handler(CommandHandler("tasks", bot.cmd_tasks))
     app.add_handler(CommandHandler("cancel", bot.cmd_cancel))
     app.add_handler(CommandHandler("result", bot.cmd_result))

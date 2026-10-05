@@ -36,6 +36,12 @@ class FakeMessage:
 
     async def reply_photo(self, photo, caption=None, **kw):
         self.photos.append(caption)
+        self.photo_markups = getattr(self, "photo_markups", []) + [kw.get("reply_markup")]
+
+    async def reply_text(self, text, **kw):
+        m = FakeMessage(self.chat_id)
+        self.replies = getattr(self, "replies", []) + [(text, kw.get("reply_markup"), m)]
+        return m
 
 
 class FakeQuery:
@@ -74,7 +80,20 @@ class FakeAPI:
         return {"result": {"Results": []}}
 
     async def export_image(self, task_id, view, sort=None):
+        self.sort = sort
         return b"img-" + view.encode()
+
+    async def list_profiles(self):
+        return [{"uuid": "u-1", "name": "3399", "url": "trojan://pw@hk.com:443#HK", "is_active": True},
+                {"uuid": "u-2", "name": "old", "url": "trojan://pw@jp.com:443#JP", "is_active": False}]
+
+    async def create_profile(self, name, url):
+        self.created = (name, url)
+        return {"uuid": "u-3", "name": name}
+
+    async def create_share(self, task_id, title, hide_private_info=True):
+        self.shared = (task_id, title, hide_private_info)
+        return {"uuid": "share-1"}
 
 
 class FakeBot:
@@ -144,7 +163,7 @@ def test_menu_flow():
         await bot._on_select(FakeQuery("sel:ab:go", 1), ctx)
 
         name, matrices = bot.api.submitted
-        assert name.startswith("TG 自定义测试")
+        assert name.startswith("临时订阅 · 自定义测试")
         assert {"Type": "TEST_SCRIPT", "Params": "INTERNAL::nf"} in matrices
         assert "ab" not in bot.selections
 
@@ -244,7 +263,7 @@ def test_selectable_backends_filter_and_order():
         bot = SpeedBot(Config(bot_token="t", api_key="k"))
         bot.api = FakeAPI()
         backends = await bot._selectable_backends()
-        assert [b["client_id"] for b in backends] == ["jp", "hk"]  # 离线、不允许调用的被排除，按排队数排序
+        assert [b["client_id"] for b in backends] == ["hk", "jp"]  # 离线、不允许调用的被排除，保持 API 顺序
         assert SpeedBot._match_backend(backends, "香港 hkt")["client_id"] == "hk"
         assert SpeedBot._match_backend(backends, "us") is None
 
@@ -260,24 +279,32 @@ def make_sel(bot, **kw):
                      skipped=0, name_filter=None, slave=None, **kw)
 
 
-def test_quick_command_picks_backend_then_submits():
+def test_quick_command_picks_backend_then_sort_then_submits():
     async def run():
         bot = SpeedBot(Config(bot_token="t", api_key="k"))
         bot.api = FakeAPI()
         sel = make_sel(bot, options={"rtt", "speed"}, backends=await bot._selectable_backends(), quick="speed",
-                       page="backends")
+                       page="backends", label="3399")
         bot.selections["q1"] = sel
         ctx = FakeContext()
 
         await bot._render_menu("q1", sel)
-        labels = buttons(sel.status.edits[-1][1])
-        assert labels[0] == "✅ 🤖 自动选择（推荐）" and "🟢 日本 IIJ · 排队 1" in labels
+        text, markup = sel.status.edits[-1]
+        assert "选择测速后端" in text and "任务：<b>3399</b>" in text
+        assert buttons(markup) == ["✅ 🤖 自动选择", "香港 HKT (hk)", "日本 IIJ (jp)", "❌ 终止操作"]
 
-        await bot._on_select(FakeQuery("sel:q1:b:1", 1), ctx)  # 第 2 个：香港
-        assert bot.api.slave_id == "hk" and bot.api.submitted[0].startswith("TG 测速")
-        assert any("后端：香港 HKT" in text for text, _ in sel.status.edits)
-        for t in ctx.application.tasks:
-            t.close()
+        await bot._on_select(FakeQuery("sel:q1:b:0", 1), ctx)  # 香港
+        text, markup = sel.status.edits[-1]
+        assert "选择排序方式" in text and "选中后端：<b>hk</b>" in text
+        assert buttons(markup) == ["📋 订阅顺序（默认）", "🀄 节点名（升序）", "🚀 平均速度（升序）", "🚀 平均速度（降序）",
+                                   "⏱ 延迟（升序）", "⏱ 延迟（降序）", "❌ 终止操作"]
+        assert bot.api.submitted is None
+
+        await bot._on_select(FakeQuery("sel:q1:o:0", 1), ctx)  # 订阅顺序
+        assert bot.api.slave_id == "hk" and bot.api.submitted[0].startswith("3399 · 测速")
+        await ctx.application.tasks[0]
+        assert bot.api.sort is None  # 订阅顺序：不传 sort
+        assert "✅ 任务 <b>3399</b> 已完成" in sel.status.photos[0]
 
     asyncio.run(run())
 
@@ -297,9 +324,9 @@ def test_menu_backend_page_and_pagination():
 
         await bot._on_select(FakeQuery("sel:m1:backends", 1), ctx)
         labels = buttons(sel.status.edits[-1][1])
-        assert "1/2" in labels and "下一页 ▸" in labels and "◂ 返回" in labels
+        assert labels[-2:] == ["下一页", "◂ 返回"] and "1/2" in labels and "·" in labels
         await bot._on_select(FakeQuery("sel:m1:bp:1", 1), ctx)
-        assert "🟢 B9 · 排队 0" in buttons(sel.status.edits[-1][1])
+        assert "B9 (b9)" in buttons(sel.status.edits[-1][1])
         await bot._on_select(FakeQuery("sel:m1:b:9", 1), ctx)
         assert sel.slave == "b9" and sel.page == "main"
         assert "🖥 后端：B9 ▸" in buttons(sel.status.edits[-1][1])
@@ -308,5 +335,88 @@ def test_menu_backend_page_and_pagination():
         assert bot.api.slave_id == "b9"
         for t in ctx.application.tasks:
             t.close()
+
+    asyncio.run(run())
+
+
+def group_update(text, user_id=1):
+    msg = FakeMessage(-100)
+    msg.text, msg.caption, msg.chat = text, None, None
+    user = FakeUser(user_id)
+    user.is_bot = False
+    upd = FakeUpdate(msg, -100, "supergroup", user)
+    upd.effective_chat.title = "测速群"
+    return upd, msg
+
+
+def test_group_speed_by_profile_name_with_share():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100},
+                              task_url="https://scp.example/task/{task_id}",
+                              share_url="https://scp.example/share/{uuid}"))
+        bot.api = FakeAPI()
+        upd, msg = group_update("/speed 3399")
+        ctx = FakeContext(["3399"])
+        await bot.cmd_test(upd, ctx)
+
+        status = msg.replies[-1][2]  # 选择菜单直接在群里，回复发起人的消息
+        assert "选择测速后端" in status.edits[-1][0]
+        sid = next(iter(bot.selections))
+        await bot._on_select(FakeQuery(f"sel:{sid}:b:auto", 1), ctx)
+        await bot._on_select(FakeQuery(f"sel:{sid}:o:3", 1), ctx)  # 平均速度（降序）
+        assert bot.api.slave_id is None and bot.api.submitted[0].startswith("3399 · 测速")
+
+        await ctx.application.tasks[0]
+        assert bot.api.sort == "avg_speed_desc"
+        assert bot.api.shared == ("11111111-1111-1111-1111-111111111111", "3399", True)
+        share_button = status.photo_markups[0].inline_keyboard[0][0]
+        assert share_button.text == "📊 查看详情" and share_button.url == "https://scp.example/share/share-1"
+        assert "<a>u1</a>" in status.photos[0]  # 结果 @ 发起人
+
+    asyncio.run(run())
+
+
+def test_group_unknown_or_inactive_profile():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
+        bot.api = FakeAPI()
+        for name in ("nope", "old"):
+            upd, msg = group_update(f"/speed {name}")
+            await bot.cmd_test(upd, FakeContext([name]))
+            text, markup, _ = msg.replies[-1]
+            assert "未找到订阅" in text and markup.inline_keyboard[0][0].url.startswith("https://t.me/speedbot?start=")
+        assert not bot.selections
+
+    asyncio.run(run())
+
+
+def test_progress_text():
+    from bot.formatter import build_plan
+    from bot.main import TaskView
+    v = TaskView("tid", "3399", "测速 · @u\n节点 2 个\nID <code>tid</code>", "自动选择", build_plan("测速", {"speed"}))
+    assert SpeedBot._task_text(v, "pending").startswith("⏳ 任务 <b>3399</b> 准备中…")
+    running = SpeedBot._task_text(v, "running", 1, 4, backend="上海电信")
+    assert running.startswith("⚡ 任务 <b>3399</b> 进行中…\n<code>[████░░░░░░░░░░░░]</code> 25%")
+    assert running.endswith("后端 上海电信")
+
+
+def test_sub_command():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}, admin_user_ids={9}))
+        bot.api = FakeAPI()
+
+        upd, msg = group_update("/sub")
+        await bot.cmd_sub(upd, FakeContext([]))
+        listing = msg.replies[-1][0]
+        assert "<code>3399</code>" in listing and "old" not in listing and "trojan" not in listing
+
+        upd, msg = group_update("/sub add x https://a.com/sub")
+        await bot.cmd_sub(upd, FakeContext(["add", "x", "https://a.com/sub"]))
+        assert "只有管理员" in msg.replies[-1][0]
+
+        dm = FakeMessage(9)
+        admin = FakeUser(9)
+        await bot.cmd_sub(FakeUpdate(dm, 9, "private", admin), FakeContext(["add", "新订阅", "https://a.com/sub"]))
+        assert bot.api.created == ("新订阅", "https://a.com/sub") and "已添加" in dm.replies[-1][0]
 
     asyncio.run(run())

@@ -73,6 +73,19 @@ class SCPClient:
     async def list_scripts(self) -> list[dict]:
         return await self._request("GET", "/api/v1/scripts") or []
 
+    async def list_profiles(self) -> list[dict]:
+        return await self._request("GET", "/api/v1/profiles") or []
+
+    async def create_profile(self, name: str, url: str) -> dict:
+        return await self._request("POST", "/api/v1/profiles", json={"name": name, "url": url})
+
+    async def delete_profile(self, uuid: str) -> None:
+        await self._request("DELETE", f"/api/v1/profiles/{uuid}")
+
+    async def create_share(self, task_id: str, title: str, hide_private_info: bool = True) -> dict:
+        return await self._request("POST", f"/api/v1/tasks/{task_id}/share",
+                                   json={"title": title[:128], "hide_private_info": hide_private_info})
+
     async def list_tasks(self, page: int = 1, page_size: int = 10, status: str | None = None) -> dict:
         params: dict[str, Any] = {"page": page, "page_size": page_size}
         if status:

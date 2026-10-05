@@ -36,6 +36,9 @@ class Config:
     default_slave_id: str = ""
     allowed_backends: set[str] = field(default_factory=set)
     backend_select: bool = True
+    sort_select: bool = True
+    task_url: str = ""
+    share_url: str = ""
     delete_sub_message: bool = True
     sub_link_pattern: str = ""
     dm_target_ttl: float = 1800.0
@@ -61,6 +64,9 @@ class Config:
             default_slave_id=os.environ.get("DEFAULT_SLAVE_ID", ""),
             allowed_backends={x for x in os.environ.get("ALLOWED_BACKENDS", "").replace(" ", "").split(",") if x},
             backend_select=_bool(os.environ.get("BACKEND_SELECT", "true")),
+            sort_select=_bool(os.environ.get("SORT_SELECT", "true")),
+            task_url=os.environ.get("SCP_TASK_URL", ""),
+            share_url=os.environ.get("SCP_SHARE_URL", ""),
             delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "true")),
             sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),
