@@ -1,0 +1,12 @@
+services:
+  speed-bot:
+    build: .
+    container_name: speed_bot
+    env_file: .env
+    restart: unless-stopped
+    read_only: true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
