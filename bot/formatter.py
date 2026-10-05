@@ -4,28 +4,62 @@ import json
 from dataclasses import dataclass
 
 
+# 可勾选的测试项：key -> (按钮文字, 对应的矩阵类型)
+TEST_OPTIONS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "rtt": ("延迟 RTT", ("TEST_PING_RTT",)),
+    "conn": ("HTTPS 延迟", ("TEST_PING_CONN",)),
+    "loss": ("丢包率", ("TEST_PING_PACKET_LOSS",)),
+    "http": ("HTTP 状态码", ("TEST_HTTP_CODE",)),
+    "speed": ("测速", ("SPEED_AVERAGE", "SPEED_MAX", "SPEED_PER_SECOND")),
+    "udp": ("UDP 类型", ("UDP_TYPE",)),
+    "geo": ("出入口拓扑", ("GEOIP_INBOUND", "GEOIP_OUTBOUND")),
+    "hijack": ("劫持检测", ("TEST_HIJACK_DETECTION",)),
+}
+
+
 @dataclass(frozen=True)
 class Preset:
     command: str
     title: str
-    matrices: tuple[str, ...]
-    view: str = "normalview"
-    sort: str | None = None
+    options: tuple[str, ...]
 
 
 PRESETS: dict[str, Preset] = {
-    "test": Preset("test", "全面测试", (
-        "TEST_PING_RTT", "TEST_PING_CONN", "SPEED_AVERAGE", "SPEED_MAX", "SPEED_PER_SECOND", "UDP_TYPE",
-    ), sort="avg_speed_desc"),
-    "speed": Preset("speed", "测速", (
-        "TEST_PING_RTT", "SPEED_AVERAGE", "SPEED_MAX", "SPEED_PER_SECOND",
-    ), sort="avg_speed_desc"),
-    "ping": Preset("ping", "延迟测试", (
-        "TEST_PING_RTT", "TEST_PING_CONN", "TEST_HTTP_CODE", "TEST_PING_PACKET_LOSS",
-    ), sort="rtt_asc"),
-    "udp": Preset("udp", "UDP 类型测试", ("TEST_PING_RTT", "UDP_TYPE"), sort="rtt_asc"),
-    "topo": Preset("topo", "拓扑分析", ("GEOIP_INBOUND", "GEOIP_OUTBOUND"), view="topologyview"),
+    "test": Preset("test", "全面测试", ("rtt", "conn", "speed", "udp")),
+    "speed": Preset("speed", "测速", ("rtt", "speed")),
+    "ping": Preset("ping", "延迟测试", ("rtt", "conn", "http", "loss")),
+    "udp": Preset("udp", "UDP 类型测试", ("rtt", "udp")),
+    "topo": Preset("topo", "拓扑分析", ("geo",)),
 }
+
+
+@dataclass(frozen=True)
+class TestPlan:
+    """一次要提交的测试：矩阵列表、要导出的图片视图和排序方式。"""
+    title: str
+    matrices: tuple[dict, ...]
+    views: tuple[str, ...]
+    sort: str | None
+
+
+def build_plan(title: str, options: set[str] | tuple[str, ...], script_ids: tuple[str, ...] = ()) -> TestPlan:
+    """根据勾选的测试项与流媒体脚本生成测试计划。"""
+    options = set(options)
+    matrices = [
+        {"Type": t, "Params": ""}
+        for key in TEST_OPTIONS if key in options
+        for t in TEST_OPTIONS[key][1]
+    ]
+    matrices += [{"Type": "TEST_SCRIPT", "Params": f"INTERNAL::{sid}"} for sid in script_ids]
+
+    views: list[str] = []
+    if options - {"geo"} or script_ids:
+        views.append("normalview")
+    if "geo" in options:
+        views.append("topologyview")
+    sort = "avg_speed_desc" if "speed" in options else "rtt_asc" if "rtt" in options else None
+    return TestPlan(title, tuple(matrices), tuple(views), sort)
+
 
 STATUS_TEXT = {
     "pending": "⏳ 排队中",
@@ -116,6 +150,13 @@ def format_result_text(entries: list[dict], limit: int = 40) -> str:
             parts.append(f"入口 {_geo(m['GEOIP_INBOUND'])}")
         if "GEOIP_OUTBOUND" in m:
             parts.append(f"出口 {_geo(m['GEOIP_OUTBOUND'])}")
+        if "TEST_HIJACK_DETECTION" in m:
+            h = m["TEST_HIJACK_DETECTION"]
+            parts.append("劫持 " + ("-" if not h.get("RealIP") else "无" if h.get("SpeedIP") == h.get("RealIP") else "疑似"))
+        for mx in e.get("Matrices") or []:
+            if mx.get("Type") == "TEST_SCRIPT":
+                p = _payload(mx)
+                parts.append(f"{str(p.get('Key') or '脚本').removeprefix('INTERNAL::')} {p.get('Text') or '-'}")
         lines.append(f"<b>{esc(name[:40])}</b>\n  " + " | ".join(esc(p) for p in parts))
     if len(entries) > limit:
         lines.append(f"… 还有 {len(entries) - limit} 个节点未显示")
