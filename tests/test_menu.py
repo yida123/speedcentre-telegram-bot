@@ -53,8 +53,18 @@ class FakeAPI:
     async def list_scripts(self):
         return [{"id": "nf", "name": "Netflix", "type": "media"}, {"id": "ip1", "name": "IP", "type": "ip"}]
 
+    async def list_backends(self):
+        return [
+            {"client_id": "hk", "display_name": "香港 HKT", "is_online": True, "allow_public_access": True,
+             "speed_pending": 3, "conn_pending": 0},
+            {"client_id": "jp", "display_name": "日本 IIJ", "is_online": True, "speed_pending": 0, "conn_pending": 1},
+            {"client_id": "us", "display_name": "美国", "is_online": False},
+            {"client_id": "priv", "display_name": "私有", "is_online": True, "allow_public_access": False},
+        ]
+
     async def submit_task(self, name, nodes, matrices, slave_id=None):
         self.submitted = (name, matrices)
+        self.slave_id = slave_id
         return {"task_id": "11111111-1111-1111-1111-111111111111", "status": "pending"}
 
     async def get_task(self, task_id):
@@ -225,5 +235,78 @@ def test_start_deep_link_requires_membership():
 
         await bot.cmd_start(FakeUpdate(DM(1), 1, "private", FakeUser(1)), FakeContext(["g-999_test"]))
         assert "未授权" in replies[-1]
+
+    asyncio.run(run())
+
+
+def test_selectable_backends_filter_and_order():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k"))
+        bot.api = FakeAPI()
+        backends = await bot._selectable_backends()
+        assert [b["client_id"] for b in backends] == ["jp", "hk"]  # 离线、不允许调用的被排除，按排队数排序
+        assert SpeedBot._match_backend(backends, "香港 hkt")["client_id"] == "hk"
+        assert SpeedBot._match_backend(backends, "us") is None
+
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_backends={"hk"}))
+        bot.api = FakeAPI()
+        assert [b["client_id"] for b in await bot._selectable_backends()] == ["hk"]
+
+    asyncio.run(run())
+
+
+def make_sel(bot, **kw):
+    return Selection(owner=FakeUser(1), chat_id=-100, target_title="g", status=FakeMessage(), nodes=[{"Name": "n"}],
+                     skipped=0, name_filter=None, slave=None, **kw)
+
+
+def test_quick_command_picks_backend_then_submits():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k"))
+        bot.api = FakeAPI()
+        sel = make_sel(bot, options={"rtt", "speed"}, backends=await bot._selectable_backends(), quick="speed",
+                       page="backends")
+        bot.selections["q1"] = sel
+        ctx = FakeContext()
+
+        await bot._render_menu("q1", sel)
+        labels = buttons(sel.status.edits[-1][1])
+        assert labels[0] == "✅ 🤖 自动选择（推荐）" and "🟢 日本 IIJ · 排队 1" in labels
+
+        await bot._on_select(FakeQuery("sel:q1:b:1", 1), ctx)  # 第 2 个：香港
+        assert bot.api.slave_id == "hk" and bot.api.submitted[0].startswith("TG 测速")
+        assert any("后端：香港 HKT" in text for text, _ in sel.status.edits)
+        for t in ctx.application.tasks:
+            t.close()
+
+    asyncio.run(run())
+
+
+def test_menu_backend_page_and_pagination():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k"))
+        bot.api = FakeAPI()
+        many = [{"client_id": f"b{i}", "display_name": f"B{i}", "is_online": True} for i in range(10)]
+
+        async def list_backends():
+            return many
+        bot.api.list_backends = list_backends
+        sel = make_sel(bot, options={"rtt"})
+        bot.selections["m1"] = sel
+        ctx = FakeContext()
+
+        await bot._on_select(FakeQuery("sel:m1:backends", 1), ctx)
+        labels = buttons(sel.status.edits[-1][1])
+        assert "1/2" in labels and "下一页 ▸" in labels and "◂ 返回" in labels
+        await bot._on_select(FakeQuery("sel:m1:bp:1", 1), ctx)
+        assert "🟢 B9 · 排队 0" in buttons(sel.status.edits[-1][1])
+        await bot._on_select(FakeQuery("sel:m1:b:9", 1), ctx)
+        assert sel.slave == "b9" and sel.page == "main"
+        assert "🖥 后端：B9 ▸" in buttons(sel.status.edits[-1][1])
+
+        await bot._on_select(FakeQuery("sel:m1:go", 1), ctx)
+        assert bot.api.slave_id == "b9"
+        for t in ctx.application.tasks:
+            t.close()
 
     asyncio.run(run())

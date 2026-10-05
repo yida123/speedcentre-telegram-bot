@@ -36,6 +36,7 @@ FINAL_STATUSES = {"completed", "failed", "canceled"}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 SELECTION_TTL = 600  # 测试项选择菜单的有效期（秒）
+BACKENDS_PER_PAGE = 8
 NOTICE_TTL = 60  # 群内私聊引导消息自动删除时间（秒）
 
 
@@ -64,8 +65,12 @@ class Selection:
     nodes: list[dict]
     skipped: int
     name_filter: str | None
-    slave: str | None
+    slave: str | None  # 选定的后端 ID，None 表示自动选择
     options: set[str]
+    slave_name: str | None = None
+    backends: list[dict] = field(default_factory=list)  # 可选后端快照
+    backend_page: int = 0
+    quick: str | None = None  # 快捷命令：选完后端直接按该预设开测
     scripts: set[str] = field(default_factory=set)
     script_list: list[tuple[str, str]] = field(default_factory=list)
     page: str = "main"
@@ -78,7 +83,7 @@ HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 测试进度和结果会发回群里并 @ 你。为防止泄露，群里出现的订阅链接会被自动删除。
 
 <b>测试命令</b>：
-/test — 弹出菜单，自选测试项目（延迟、测速、UDP、拓扑、劫持检测、流媒体解锁…）
+/test — 弹出菜单，自选测试项目（延迟、测速、UDP、拓扑、劫持检测、流媒体解锁…）和后端
 /speed — 测速
 /ping — 延迟测试（RTT / HTTPS / 丢包）
 /udp — UDP NAT 类型
@@ -86,7 +91,7 @@ HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 
 <b>可选参数</b>：
 <code>-f 正则</code> 按节点名过滤，例如 <code>-f "香港|HK"</code>
-<code>-s 后端ID</code> 指定测试后端（见 /backends）
+<code>-s 后端ID或名称</code> 直接指定后端（见 /backends），不指定时会弹出后端选择按钮
 
 <b>其他</b>：
 /backends — 后端列表
@@ -106,6 +111,7 @@ class SpeedBot:
         self.selections: dict[str, Selection] = {}  # 菜单 id -> 选择状态
         self.dm_targets: dict[int, DMTarget] = {}  # user_id -> 私聊提交的结果去向
         self._scripts: tuple[float, list[tuple[str, str]]] | None = None
+        self._backends: tuple[float, list[dict]] | None = None
 
     # ------------------------------------------------------------ 权限
 
@@ -155,9 +161,11 @@ class SpeedBot:
             await update.effective_message.reply_text("暂无可用后端。")
             return
         backends.sort(key=lambda b: (not b.get("is_online"), b.get("display_name") or ""))
-        lines = ["<b>后端列表</b>"]
+        lines = ["<b>后端列表</b>（🟢 在线 · 🔴 离线 · 🚫 不可选）"]
         for b in backends:
             state = "🟢" if b.get("is_online") else "🔴"
+            if not self._backend_allowed(b):
+                state = "🚫"
             lines.append(
                 f"{state} <b>{esc(b.get('display_name') or '-')}</b>\n"
                 f"    ID <code>{esc(b.get('client_id'))}</code> · 队列 连接 {b.get('conn_pending', 0)} / "
@@ -441,14 +449,29 @@ class SpeedBot:
             await self._edit(status, f"❌ 没有可测试的节点：{esc(detail)}")
             return
 
+        backends = await self._selectable_backends()
+        chosen = None
+        if slave:
+            chosen = self._match_backend(backends, slave)
+            if not chosen:
+                await self._edit(status, f"❌ 后端 <code>{esc(slave)}</code> 不存在、离线或不允许使用，发送 /backends 查看可用后端。")
+                return
+        elif self.cfg.default_slave_id:
+            chosen = self._match_backend(backends, self.cfg.default_slave_id)
+
         sel = Selection(
             owner=user, chat_id=target.chat_id, target_title=target.title, status=status, nodes=nodes,
-            skipped=skipped, name_filter=name_filter, slave=slave, options=set(preset.options),
+            skipped=skipped, name_filter=name_filter, slave=chosen and chosen["client_id"],
+            slave_name=chosen and chosen.get("display_name"), options=set(preset.options), backends=backends,
         )
-        if command != "test":
+        ask_backend = self.cfg.backend_select and not slave and len(backends) > 1
+        if command != "test" and not ask_backend:
             # 快捷命令直接按预设开测
             await self._submit(sel, build_plan(preset.title, preset.options), context.application)
             return
+        if command != "test":
+            # 快捷命令：先选后端，点击后立即开测
+            sel.quick, sel.page = command, "backends"
         self._purge_selections()
         sid = secrets.token_hex(4)
         self.selections[sid] = sel
@@ -474,11 +497,48 @@ class SpeedBot:
             self._scripts = (time.monotonic(), media)
         return self._scripts[1]
 
+    async def _all_backends(self) -> list[dict]:
+        """后端列表，缓存 30 秒（排队数会变化）。"""
+        if self._backends is None or time.monotonic() - self._backends[0] > 30:
+            try:
+                backends = await self.api.list_backends()
+            except APIError as e:
+                log.warning("获取后端列表失败：%s", e)
+                return self._backends[1] if self._backends else []
+            self._backends = (time.monotonic(), backends)
+        return self._backends[1]
+
+    def _backend_allowed(self, b: dict) -> bool:
+        if b.get("allow_public_access") is False:
+            return False
+        return not self.cfg.allowed_backends or b.get("client_id") in self.cfg.allowed_backends
+
+    async def _selectable_backends(self) -> list[dict]:
+        """用户可以选择的后端：在线、允许 Copilot 调用、在 ALLOWED_BACKENDS 内，按排队数排序。"""
+        backends = [b for b in await self._all_backends() if b.get("is_online") and self._backend_allowed(b)]
+        return sorted(backends, key=lambda b: (b.get("speed_pending", 0) + b.get("conn_pending", 0),
+                                               b.get("display_name") or ""))
+
+    @staticmethod
+    def _match_backend(backends: list[dict], key: str) -> dict | None:
+        """按后端 ID 或显示名称（不区分大小写）查找。"""
+        for b in backends:
+            if b.get("client_id") == key:
+                return b
+        key = key.lower()
+        return next((b for b in backends if (b.get("display_name") or "").lower() == key), None)
+
+    @staticmethod
+    def _backend_label(b: dict) -> str:
+        pending = b.get("speed_pending", 0) + b.get("conn_pending", 0)
+        return f"{b.get('display_name') or b.get('client_id')} · 排队 {pending}"
+
     @staticmethod
     def _sel_header(sel: "Selection") -> str:
         text = f"节点 {len(sel.nodes)} 个"
         if sel.skipped:
             text += f"（跳过 {sel.skipped} 个）"
+        text += f"\n后端：{esc(sel.slave_name or sel.slave or '自动选择')}"
         if sel.name_filter:
             text += f"\n过滤：<code>{esc(sel.name_filter)}</code>"
         return text
@@ -493,6 +553,28 @@ class SpeedBot:
             return InlineKeyboardButton(label, callback_data=f"sel:{sid}:{action}")
 
         rows: list[list[InlineKeyboardButton]] = []
+        if sel.page == "backends":
+            title = PRESETS[sel.quick].title if sel.quick else "测试"
+            text = (f"<b>选择{esc(title)}后端</b> · {sel.owner.mention_html()}\n{self._sel_header(sel)}\n\n"
+                    + ("点击后端立即开始测试。" if sel.quick else "选择后端后返回菜单。"))
+            pages = max(1, -(-len(sel.backends) // BACKENDS_PER_PAGE))
+            sel.backend_page = min(sel.backend_page, pages - 1)
+            start = sel.backend_page * BACKENDS_PER_PAGE
+            mark = lambda on: "✅ " if on else ""  # noqa: E731
+            rows.append([btn(mark(sel.slave is None) + "🤖 自动选择（推荐）", "b:auto")])
+            for n, b in enumerate(sel.backends[start:start + BACKENDS_PER_PAGE], start):
+                rows.append([btn(mark(sel.slave == b.get("client_id")) + "🟢 " + self._backend_label(b)[:40], f"b:{n}")])
+            if pages > 1:
+                nav = []
+                if sel.backend_page > 0:
+                    nav.append(btn("◂ 上一页", f"bp:{sel.backend_page - 1}"))
+                nav.append(btn(f"{sel.backend_page + 1}/{pages}", "noop"))
+                if sel.backend_page < pages - 1:
+                    nav.append(btn("下一页 ▸", f"bp:{sel.backend_page + 1}"))
+                rows.append(nav)
+            rows.append([btn("✖️ 取消", "x")] if sel.quick else [btn("◂ 返回", "main")])
+            await self._edit(sel.status, text, InlineKeyboardMarkup(rows))
+            return
         if sel.page == "scripts":
             toggles = [btn(("✅ " if i in sel.scripts else "⬜ ") + name[:20], f"s:{n}")
                        for n, (i, name) in enumerate(sel.script_list)]
@@ -504,6 +586,7 @@ class SpeedBot:
                        for k, (label, _) in TEST_OPTIONS.items()]
             rows += [toggles[i:i + 2] for i in range(0, len(toggles), 2)]
             rows.append([btn(f"🎬 流媒体解锁（已选 {len(sel.scripts)}）▸", "scripts")])
+            rows.append([btn(f"🖥 后端：{(sel.slave_name or sel.slave or '自动选择')[:24]} ▸", "backends")])
         rows.append([btn("▶️ 开始测试", "go"), btn("✖️ 取消", "x")])
         await self._edit(sel.status, text, InlineKeyboardMarkup(rows))
 
@@ -530,6 +613,33 @@ class SpeedBot:
                 return
             sel.page = "scripts"
         elif kind == "main":
+            sel.page = "main"
+        elif kind == "backends":
+            sel.backends = await self._selectable_backends()
+            sel.page, sel.backend_page = "backends", 0
+        elif kind == "bp" and arg.isdigit():
+            sel.backend_page = int(arg)
+        elif kind == "noop":
+            await q.answer()
+            return
+        elif kind == "b":
+            if arg == "auto":
+                sel.slave = sel.slave_name = None
+            elif arg.isdigit() and int(arg) < len(sel.backends):
+                b = sel.backends[int(arg)]
+                sel.slave, sel.slave_name = b.get("client_id"), b.get("display_name")
+            else:
+                await q.answer()
+                return
+            if sel.quick:
+                if self._busy(sel.chat_id):
+                    await q.answer("本群已有任务在运行，请等待完成后再试。", show_alert=True)
+                    return
+                self.selections.pop(sid, None)
+                await q.answer("正在提交…")
+                preset = PRESETS[sel.quick]
+                await self._submit(sel, build_plan(preset.title, preset.options), context.application)
+                return
             sel.page = "main"
         elif kind == "s" and arg.isdigit() and int(arg) < len(sel.script_list):
             sel.scripts ^= {sel.script_list[int(arg)][0]}
@@ -565,8 +675,7 @@ class SpeedBot:
         await self._edit(status, f"🚀 正在提交任务…\n{self._sel_header(sel)}")
         task_name = f"TG {plan.title} · {user.full_name}"[:128]
         try:
-            data = await self.api.submit_task(task_name, sel.nodes, list(plan.matrices),
-                                              slave_id=sel.slave or self.cfg.default_slave_id or None)
+            data = await self.api.submit_task(task_name, sel.nodes, list(plan.matrices), slave_id=sel.slave)
         except APIError as e:
             await self._edit(status, f"❌ 提交任务失败：{esc(e)}")
             return
