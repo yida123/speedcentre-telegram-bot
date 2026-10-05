@@ -4,7 +4,7 @@ import json
 import yaml
 
 from bot.formatter import format_result_text, format_stats
-from bot.subscription import extract_sources, parse_content, parse_uri, to_api_nodes
+from bot.subscription import contains_sensitive_link, extract_sources, parse_content, parse_uri, to_api_nodes
 
 
 def b64(s: str) -> str:
@@ -85,3 +85,12 @@ def test_format_result():
     text = format_result_text(entries)
     assert "120ms" in text and "10.0MB/s" in text and "Full Cone" in text
     assert "可用 1/1" in format_stats(entries)
+
+
+def test_contains_sensitive_link():
+    assert contains_sensitive_link("vmess://abc")
+    assert contains_sensitive_link("https://a.com/api/v1/client/subscribe?token=x")
+    assert contains_sensitive_link("https://a.com/sub?target=clash")
+    assert contains_sensitive_link("https://a.com/link/AbC123?clash=1")
+    assert not contains_sensitive_link("https://github.com/yida123/speed_bot")
+    assert not contains_sensitive_link("今天测速怎么样")

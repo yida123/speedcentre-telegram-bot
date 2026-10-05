@@ -24,8 +24,12 @@ class FakeUser:
 
 
 class FakeMessage:
-    def __init__(self):
-        self.edits, self.photos = [], []
+    def __init__(self, chat_id=-100):
+        self.chat_id = chat_id
+        self.edits, self.photos, self.deleted = [], [], False
+
+    async def delete(self):
+        self.deleted = True
 
     async def edit_text(self, text, **kw):
         self.edits.append((text, kw.get("reply_markup")))
@@ -63,17 +67,40 @@ class FakeAPI:
         return b"img-" + view.encode()
 
 
+class FakeBot:
+    username = "speedbot"
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, **kw):
+        m = FakeMessage(chat_id)
+        self.sent.append((chat_id, text, kw.get("reply_markup"), m))
+        return m
+
+    async def get_chat_member(self, chat_id, user_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(status="member" if user_id == 1 else "left")
+
+    async def get_chat(self, chat_id):
+        from types import SimpleNamespace
+        return SimpleNamespace(title="测速群")
+
+
 class FakeApp:
     def __init__(self):
         self.tasks = []
+        self.bot = FakeBot()
 
     def create_task(self, coro, name=None):
         self.tasks.append(coro)
 
 
 class FakeContext:
-    def __init__(self):
+    def __init__(self, args=None):
         self.application = FakeApp()
+        self.bot = self.application.bot
+        self.args = args or []
 
 
 def buttons(markup):
@@ -85,7 +112,8 @@ def test_menu_flow():
         bot = SpeedBot(Config(bot_token="t", api_key="k", admin_user_ids={99}))
         bot.api = FakeAPI()
         status = FakeMessage()
-        sel = Selection(owner=FakeUser(1), chat_id=-100, status=status, nodes=[{"Name": "n"}], skipped=0,
+        sel = Selection(owner=FakeUser(1), chat_id=-100, target_title="g", status=status, nodes=[{"Name": "n"}],
+                        skipped=0,
                         name_filter=None, slave=None, options={"rtt"})
         bot.selections["ab"] = sel
         ctx = FakeContext()
@@ -117,5 +145,85 @@ def test_menu_flow():
         q = FakeQuery("sel:ab:go", 1)  # 已提交后菜单失效
         await bot._on_select(q, ctx)
         assert "过期" in q.answers[0]
+
+    asyncio.run(run())
+
+
+def test_dm_submission_posts_to_group():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k"))
+        bot.api = FakeAPI()
+        dm_status = FakeMessage(chat_id=1)
+        sel = Selection(owner=FakeUser(1), chat_id=-100, target_title="测速群", status=dm_status,
+                        nodes=[{"Name": "n"}], skipped=0, name_filter=None, slave=None, options={"rtt"})
+        bot.selections["cd"] = sel
+        ctx = FakeContext()
+        await bot._on_select(FakeQuery("sel:cd:go", 1), ctx)
+
+        assert "已提交" in dm_status.edits[-1][0] and "测速群" in dm_status.edits[-1][0]
+        chat_id, text, _, group_msg = ctx.bot.sent[0]
+        assert chat_id == -100 and "<a>u1</a>" in text  # 群消息 @ 发起人
+        await ctx.application.tasks[0]
+        assert group_msg.photos and "<a>u1</a>" in group_msg.photos[0]  # 结果图发在群里
+        assert not dm_status.photos
+
+    asyncio.run(run())
+
+
+class FakeUpdate:
+    def __init__(self, msg, chat_id, chat_type, user):
+        from types import SimpleNamespace
+        self.effective_message = msg
+        self.effective_chat = SimpleNamespace(id=chat_id, type=chat_type)
+        self.effective_user = user
+
+
+def test_group_sub_link_deleted_and_redirected():
+    from telegram.ext import ApplicationHandlerStop
+    import pytest
+
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
+        ctx = FakeContext()
+        user = FakeUser(1)
+        user.is_bot = False
+
+        msg = FakeMessage()
+        msg.text, msg.caption = "我的订阅 https://airport.example/api/v1/client/subscribe?token=abc", None
+        with pytest.raises(ApplicationHandlerStop):
+            await bot.on_group_message(FakeUpdate(msg, -100, "supergroup", user), ctx)
+        assert msg.deleted
+        chat_id, text, markup, _ = ctx.bot.sent[0]
+        assert chat_id == -100 and "已删除" in text
+        assert markup.inline_keyboard[0][0].url == "https://t.me/speedbot?start=g-100_test"
+
+        normal = FakeMessage()
+        normal.text, normal.caption = "看看 https://github.com/foo/bar", None
+        await bot.on_group_message(FakeUpdate(normal, -100, "supergroup", user), ctx)
+        assert not normal.deleted
+        for t in ctx.application.tasks:  # 引导消息的定时删除协程
+            t.close()
+
+    asyncio.run(run())
+
+
+def test_start_deep_link_requires_membership():
+    async def run():
+        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
+        replies = []
+
+        class DM(FakeMessage):
+            async def reply_text(self, text, **kw):
+                replies.append(text)
+
+        await bot.cmd_start(FakeUpdate(DM(1), 1, "private", FakeUser(1)), FakeContext(["g-100_speed"]))
+        assert bot.dm_targets[1].chat_id == -100 and bot.dm_targets[1].command == "speed"
+        assert "测速群" in replies[-1]
+
+        await bot.cmd_start(FakeUpdate(DM(2), 2, "private", FakeUser(2)), FakeContext(["g-100_test"]))
+        assert 2 not in bot.dm_targets and "不是该群成员" in replies[-1]
+
+        await bot.cmd_start(FakeUpdate(DM(1), 1, "private", FakeUser(1)), FakeContext(["g-999_test"]))
+        assert "未授权" in replies[-1]
 
     asyncio.run(run())

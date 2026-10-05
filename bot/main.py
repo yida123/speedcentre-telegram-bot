@@ -10,10 +10,11 @@ from dataclasses import dataclass, field
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User,
 )
-from telegram.constants import ChatType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler,
+    filters,
 )
 
 from .api import APIError, SCPClient
@@ -23,7 +24,8 @@ from .formatter import (
     progress_bar,
 )
 from .subscription import (
-    SubscriptionError, extract_sources, fetch_subscription, parse_uri, to_api_nodes,
+    DEFAULT_SUB_LINK_PATTERN, SubscriptionError, contains_sensitive_link, extract_sources, fetch_subscription,
+    parse_uri, to_api_nodes,
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -34,14 +36,31 @@ FINAL_STATUSES = {"completed", "failed", "canceled"}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 SELECTION_TTL = 600  # 测试项选择菜单的有效期（秒）
+NOTICE_TTL = 60  # 群内私聊引导消息自动删除时间（秒）
+
+
+@dataclass
+class DMTarget:
+    """私聊提交的测试结果要发往的会话。"""
+    chat_id: int
+    title: str
+    command: str
+    updated: float = field(default_factory=time.monotonic)
+
+    def expired(self, ttl: float) -> bool:
+        return time.monotonic() - self.updated > ttl
+
+    def touch(self) -> None:
+        self.updated = time.monotonic()
 
 
 @dataclass
 class Selection:
     """/test 解析完节点后、等待用户选择测试项时的状态。"""
     owner: User
-    chat_id: int
-    status: Message
+    chat_id: int  # 结果发往的会话（通常是群）
+    target_title: str
+    status: Message  # 私聊里的菜单/状态消息
     nodes: list[dict]
     skipped: int
     name_filter: str | None
@@ -55,7 +74,10 @@ class Selection:
 
 HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 
-<b>测试命令</b>（参数为订阅链接或节点分享链接，也可以回复一条含链接的消息）：
+<b>使用方式</b>：在群里发送测试命令，点击「私聊发送订阅」按钮，在私聊中发送订阅链接或节点链接。
+测试进度和结果会发回群里并 @ 你。为防止泄露，群里出现的订阅链接会被自动删除。
+
+<b>测试命令</b>：
 /test — 弹出菜单，自选测试项目（延迟、测速、UDP、拓扑、劫持检测、流媒体解锁…）
 /speed — 测速
 /ping — 延迟测试（RTT / HTTPS / 丢包）
@@ -72,7 +94,7 @@ HELP_TEXT = """<b>SpeedCentre+ 测试 Bot</b>
 /result 任务ID — 重新获取结果图
 /cancel 任务ID — 取消任务（也可点击按钮）
 
-示例：<code>/test https://example.com/sub -f 香港</code>"""
+私聊示例：<code>/test https://example.com/sub -f 香港</code>，或直接发送链接"""
 
 
 class SpeedBot:
@@ -82,6 +104,7 @@ class SpeedBot:
         self.running: dict[int, set[str]] = {}  # chat_id -> task_ids
         self.owners: dict[str, int] = {}  # task_id -> user_id
         self.selections: dict[str, Selection] = {}  # 菜单 id -> 选择状态
+        self.dm_targets: dict[int, DMTarget] = {}  # user_id -> 私聊提交的结果去向
         self._scripts: tuple[float, list[tuple[str, str]]] | None = None
 
     # ------------------------------------------------------------ 权限
@@ -238,23 +261,150 @@ class SpeedBot:
         return len(self.running.get(chat_id, ())) >= self.cfg.max_tasks_per_chat
 
     async def cmd_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, chat = update.effective_message, update.effective_chat
+        command = (msg.text or "").split()[0].lstrip("/").split("@")[0].lower()
+        if command not in PRESETS:
+            command = "test"
+        if chat.type == ChatType.PRIVATE:
+            await self._private_test(update, context, command, context.args or [])
+            return
         if not await self.guard(update):
             return
-        msg = update.effective_message
-        command = (msg.text or "").split()[0].lstrip("/").split("@")[0].lower()
-        preset = PRESETS.get(command, PRESETS["test"])
-        rest, name_filter, slave = self._parse_args(context.args or [])
+        # 群里不接收订阅，引导发起人私聊提交，结果再发回本群
+        deleted = False
+        if self.cfg.delete_sub_message and any(extract_sources(msg.text or "")):
+            deleted = await self._delete(msg)
+        await self._send_dm_prompt(msg, update.effective_user, chat.id, command, context, deleted=deleted)
 
-        text = " ".join(rest)
-        from_reply = False
-        subs, uris = extract_sources(text)
+    # ------------------------------------------------------------ 群内订阅保护与私聊引导
+
+    def _dm_markup(self, bot_username: str, chat_id: int, command: str) -> InlineKeyboardMarkup:
+        url = f"https://t.me/{bot_username}?start=g{chat_id}_{command}"
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 私聊发送订阅", url=url)]])
+
+    async def _send_dm_prompt(self, msg: Message, user: User, chat_id: int, command: str,
+                              context: ContextTypes.DEFAULT_TYPE, deleted: bool = False) -> None:
+        title = PRESETS[command].title if command != "test" else "测试"
+        text = (f"{user.mention_html()} " + ("已删除你发送的订阅/节点链接，避免泄露。\n" if deleted else "")
+                + f"请点击下方按钮，在私聊中发送订阅链接发起{title}，结果会发回本群。")
+        markup = self._dm_markup(context.bot.username, chat_id, command)
+        try:
+            if deleted:
+                notice = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            else:
+                notice = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError as e:
+            log.warning("发送私聊引导失败：%s", e)
+            return
+        context.application.create_task(self._delete_later(notice, NOTICE_TTL))
+
+    async def _delete(self, msg: Message | None) -> bool:
+        if msg is None:
+            return False
+        try:
+            await msg.delete()
+            return True
+        except TelegramError as e:
+            log.warning("删除含订阅链接的消息失败（bot 需要是群管理员并有删除消息权限）：%s", e)
+            return False
+
+    async def _delete_later(self, msg: Message, delay: float) -> None:
+        await asyncio.sleep(delay)
+        await self._delete(msg)
+
+    async def on_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """授权群内出现节点链接或疑似订阅链接时立即删除，并引导发送者私聊。"""
+        msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+        if not msg or not self.cfg.delete_sub_message or not user or user.is_bot:
+            return
+        if self.cfg.allowed_chat_ids and chat.id not in self.cfg.allowed_chat_ids:
+            return
+        pattern = self.cfg.sub_link_pattern or DEFAULT_SUB_LINK_PATTERN
+        if not contains_sensitive_link(msg.text or msg.caption or "", pattern):
+            return
+        log.info("删除群 %s 中用户 %s 发送的订阅链接", chat.id, user.id)
+        deleted = await self._delete(msg)
+        await self._send_dm_prompt(msg, user, chat.id, "test", context, deleted=deleted)
+        raise ApplicationHandlerStop
+
+    async def _is_member(self, bot, chat_id: int, user_id: int) -> bool:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramError:
+            return False
+        if member.status == ChatMemberStatus.RESTRICTED:
+            return bool(getattr(member, "is_member", False))
+        return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
+
+    async def _chat_title(self, bot, chat_id: int) -> str:
+        try:
+            return (await bot.get_chat(chat_id)).title or str(chat_id)
+        except TelegramError:
+            return str(chat_id)
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, user = update.effective_message, update.effective_user
+        payload = (context.args or [""])[0]
+        m = re.fullmatch(r"g(-?\d+)_(\w+)", payload)
+        if update.effective_chat.type != ChatType.PRIVATE or not m:
+            await self.cmd_help(update, context)
+            return
+        chat_id, command = int(m.group(1)), m.group(2) if m.group(2) in PRESETS else "test"
+        if self.cfg.allowed_chat_ids and chat_id not in self.cfg.allowed_chat_ids:
+            await msg.reply_text("该群未授权使用此 Bot。")
+            return
+        if not self.is_admin(user.id) and not await self._is_member(context.bot, chat_id, user.id):
+            await msg.reply_text("你不是该群成员，无法为该群发起测试。")
+            return
+        title = await self._chat_title(context.bot, chat_id)
+        self.dm_targets[user.id] = DMTarget(chat_id, title, command)
+        await msg.reply_text(
+            f"好的，结果将发送到群「{esc(title)}」。\n\n请直接发送订阅链接或节点链接"
+            f"（可附加 <code>-f 正则</code> 过滤节点、<code>-s 后端ID</code> 指定后端）。",
+            parse_mode=ParseMode.HTML)
+
+    async def on_private_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not any(extract_sources(msg.text or "")):
+            await msg.reply_text("请发送订阅链接或节点链接。发送 /help 查看用法。")
+            return
+        target = self.dm_targets.get(update.effective_user.id)
+        command = target.command if target and not target.expired(self.cfg.dm_target_ttl) else "test"
+        await self._private_test(update, context, command, (msg.text or "").split())
+
+    async def _resolve_target(self, user: User, bot) -> DMTarget | None:
+        """私聊提交的结果发到哪里：最近点过按钮的群 > 唯一授权群 > 私聊本身（管理员或 ALLOW_PRIVATE）。"""
+        target = self.dm_targets.get(user.id)
+        if target and not target.expired(self.cfg.dm_target_ttl):
+            return target
+        if len(self.cfg.allowed_chat_ids) == 1:
+            chat_id = next(iter(self.cfg.allowed_chat_ids))
+            if self.is_admin(user.id) or await self._is_member(bot, chat_id, user.id):
+                target = DMTarget(chat_id, await self._chat_title(bot, chat_id), "test")
+                self.dm_targets[user.id] = target
+                return target
+        if self.is_admin(user.id) or self.cfg.allow_private:
+            return DMTarget(user.id, "私聊", "test")
+        return None
+
+    async def _private_test(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                            command: str, args: list[str]) -> None:
+        msg, user = update.effective_message, update.effective_user
+        target = await self._resolve_target(user, context.bot)
+        if not target:
+            await msg.reply_text("请先在授权群里发送 /test，然后点击「私聊发送订阅」按钮。")
+            return
+        target.touch()
+        preset = PRESETS[command]
+        rest, name_filter, slave = self._parse_args(args)
+
+        subs, uris = extract_sources(" ".join(rest))
         if not subs and not uris and msg.reply_to_message:
             reply = msg.reply_to_message
             subs, uris = extract_sources(reply.text or reply.caption or "")
-            from_reply = True
         if not subs and not uris:
-            await msg.reply_text(f"请提供订阅链接或节点链接，例如：\n<code>/{preset.command} https://example.com/sub</code>\n"
-                                 "或者回复一条包含链接的消息。", parse_mode=ParseMode.HTML)
+            await msg.reply_text(f"请提供订阅链接或节点链接，例如：\n<code>/{preset.command} https://example.com/sub</code>",
+                                 parse_mode=ParseMode.HTML)
             return
         if name_filter:
             try:
@@ -263,20 +413,11 @@ class SpeedBot:
                 await msg.reply_text("过滤正则无效。")
                 return
 
-        chat_id = msg.chat_id
-        if self._busy(chat_id):
-            await msg.reply_text("本群已有任务在运行，请等待完成后再试。")
+        if self._busy(target.chat_id):
+            await msg.reply_text("目标群已有任务在运行，请等待完成后再试。")
             return
 
         status = await msg.reply_text("📥 正在解析节点…")
-
-        # 订阅链接属于敏感信息，按配置删除含链接的消息（回复模式下是被回复的那条）
-        if self.cfg.delete_sub_message and subs:
-            try:
-                await (msg.reply_to_message if from_reply else msg).delete()
-            except TelegramError as e:
-                log.warning("删除含订阅链接的消息失败（bot 需要删除消息权限）：%s", e)
-
         proxies: list[dict] = []
         errors: list[str] = []
         for uri in uris:
@@ -301,8 +442,8 @@ class SpeedBot:
             return
 
         sel = Selection(
-            owner=update.effective_user, chat_id=chat_id, status=status, nodes=nodes, skipped=skipped,
-            name_filter=name_filter, slave=slave, options=set(preset.options),
+            owner=user, chat_id=target.chat_id, target_title=target.title, status=status, nodes=nodes,
+            skipped=skipped, name_filter=name_filter, slave=slave, options=set(preset.options),
         )
         if command != "test":
             # 快捷命令直接按预设开测
@@ -437,6 +578,17 @@ class SpeedBot:
         self.running.setdefault(sel.chat_id, set()).add(task_id)
         self.owners[task_id] = user.id
         header = f"<b>{esc(plan.title)}</b> · {user.mention_html()}\n任务 <code>{task_id}</code>\n{self._sel_header(sel)}"
+        if sel.chat_id != status.chat_id:
+            # 私聊提交，进度和结果发到群里并 @ 发起人
+            await self._edit(status, f"✅ 已提交，进度和结果将发送到群「{esc(sel.target_title)}」。\n"
+                                     f"任务 <code>{task_id}</code>")
+            try:
+                status = await application.bot.send_message(sel.chat_id, f"{header}\n\n⏳ 排队中",
+                                                            parse_mode=ParseMode.HTML)
+            except TelegramError as e:
+                log.warning("向群 %s 发送任务消息失败：%s", sel.chat_id, e)
+                await self._edit(sel.status, f"⚠️ 无法在群里发送消息（{esc(e)}），结果改为发到这里。\n任务 <code>{task_id}</code>")
+                status = sel.status
         log.info("chat=%s user=%s 提交任务 %s（%d 节点，%d 矩阵）",
                  sel.chat_id, user.id, task_id, len(sel.nodes), len(plan.matrices))
         application.create_task(self._watch(status, task_id, plan, header, sel.chat_id), name=f"watch-{task_id}")
@@ -581,7 +733,12 @@ def main() -> None:
 
     app = (Application.builder().token(cfg.bot_token)
            .post_init(_post_init).post_shutdown(_post_shutdown).build())
-    app.add_handler(CommandHandler(["start", "help"], bot.cmd_help))
+    # 先于其他处理器检查群消息中的订阅链接
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
+                                   bot.on_group_message), group=-1)
+    app.add_handler(CommandHandler("start", bot.cmd_start))
+    app.add_handler(CommandHandler("help", bot.cmd_help))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, bot.on_private_text))
     app.add_handler(CommandHandler("id", bot.cmd_id))
     app.add_handler(CommandHandler(list(PRESETS), bot.cmd_test))
     app.add_handler(CommandHandler("backends", bot.cmd_backends))

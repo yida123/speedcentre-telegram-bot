@@ -380,6 +380,24 @@ def extract_sources(text: str) -> tuple[list[str], list[str]]:
     return subs, nodes
 
 
+# 看起来像订阅链接的 http(s) 地址（可通过 SUB_LINK_PATTERN 覆盖）
+DEFAULT_SUB_LINK_PATTERN = (
+    r"subscri|/sub(?:\b|/|\?)|[?&](?:token|key|uuid|flag|target|clash)=|/link/|/api/v1/client|getsub"
+    r"|clash|v2ray|sing-?box|\.ya?ml(?:\?|$)"
+)
+
+
+def contains_sensitive_link(text: str, sub_pattern: str = DEFAULT_SUB_LINK_PATTERN) -> bool:
+    """消息里是否有节点分享链接，或疑似订阅的链接。"""
+    if not text:
+        return False
+    subs, nodes = extract_sources(text)
+    if nodes:
+        return True
+    pattern = re.compile(sub_pattern, re.IGNORECASE)
+    return any(pattern.search(u) for u in subs)
+
+
 def to_api_nodes(proxies: list[dict], name_filter: str | None = None, limit: int | None = None) -> tuple[list[dict], int]:
     """过滤并转换成 API 的 Node 列表。返回 (nodes, 被跳过的数量)。"""
     pattern = re.compile(name_filter, re.IGNORECASE) if name_filter else None

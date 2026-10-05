@@ -34,7 +34,9 @@ class Config:
     max_nodes: int = 100
     max_tasks_per_chat: int = 1
     default_slave_id: str = ""
-    delete_sub_message: bool = False
+    delete_sub_message: bool = True
+    sub_link_pattern: str = ""
+    dm_target_ttl: float = 1800.0
     poll_interval: float = 5.0
     task_timeout: float = 1800.0
 
@@ -55,7 +57,8 @@ class Config:
             max_nodes=int(os.environ.get("MAX_NODES", "100")),
             max_tasks_per_chat=int(os.environ.get("MAX_TASKS_PER_CHAT", "1")),
             default_slave_id=os.environ.get("DEFAULT_SLAVE_ID", ""),
-            delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "false")),
+            delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "true")),
+            sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),
             task_timeout=float(os.environ.get("TASK_TIMEOUT", "1800")),
         )
