@@ -55,25 +55,67 @@ Bot 会校验私聊用户是该群成员。不属于任何授权群的用户只�
 
 结果优先使用 API 的图片导出；若套餐不支持图片导出，则回退为文本结果。
 
-## 部署
+## 部署（Debian / Ubuntu 服务器）
 
-1. 在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 Token，并把 Bot 拉进群。
-   - **把 Bot 设为群管理员并授予「删除消息」权限**：自动删除订阅链接需要该权限，且管理员身份能让 Bot 看到群内所有消息。
-     （如果不设管理员，需要在 BotFather 里 `/setprivacy` → Disable，否则 Bot 看不到普通消息，也删不掉。）
-2. 复制配置：`cp .env.example .env`，填写 `TG_BOT_TOKEN`、`SCP_API_KEY`。
-3. 在群里发 `/id` 获取群组 ID，填到 `ALLOWED_CHAT_IDS`（**强烈建议设置**，否则任何群都能消耗你的积分）。
-4. 运行：
+### 1. 准备 Bot
+
+在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 Token，把 Bot 拉进群，
+并**设为群管理员、授予「删除消息」权限**（自动删除订阅链接需要该权限，管理员身份也能让 Bot 看到群内所有消息）。
+
+服务器需要能访问 Telegram、`api.speedcentre.plus` 以及用户的订阅地址。国内服务器请在 `.env` 里加
+`HTTPS_PROXY=http://代理地址:端口`。
+
+### 2. 安装（systemd，推荐）
+
+```bash
+sudo apt update && sudo apt install -y git
+sudo git clone https://github.com/yida123/speed_bot.git /opt/speed_bot
+# 私有仓库：用 https://<用户名>:<token>@github.com/yida123/speed_bot.git，或配置 deploy key
+sudo bash /opt/speed_bot/deploy/install.sh
+```
+
+脚本会安装 Python、创建 `speedbot` 系统用户和虚拟环境、注册开机自启的 `speed-bot` 服务，并生成 `/opt/speed_bot/.env`。
+
+### 3. 填写配置并启动
+
+```bash
+sudo nano /opt/speed_bot/.env      # 填 TG_BOT_TOKEN、SCP_API_KEY、ADMIN_USER_IDS
+sudo systemctl start speed-bot
+```
+
+在群里发 `/id` 拿到群组 ID，填到 `ALLOWED_CHAT_IDS`（**务必设置**，否则任何群都能消耗你的积分），然后重启：
+
+```bash
+sudo systemctl restart speed-bot
+```
+
+### 日常运维
+
+```bash
+sudo systemctl status speed-bot           # 运行状态
+sudo journalctl -u speed-bot -f           # 实时日志
+sudo systemctl restart speed-bot          # 改完 .env 后重启
+sudo bash /opt/speed_bot/deploy/install.sh --update   # 拉取最新代码并重启
+```
+
+服务挂掉会在 5 秒后自动重启，服务器重启后自动运行。
+
+### 或者用 Docker
+
+```bash
+sudo apt install -y docker.io docker-compose-v2
+cd /opt/speed_bot && cp .env.example .env && nano .env
+sudo docker compose up -d --build         # 启动
+sudo docker compose logs -f               # 日志
+git pull && sudo docker compose up -d --build   # 更新
+```
+
+### 本地直接运行（调试用）
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env && nano .env
 python -m bot.main
-```
-
-或 Docker：
-
-```bash
-docker build -t speed_bot .
-docker run -d --name speed_bot --env-file .env --restart unless-stopped speed_bot
 ```
 
 ## 配置项
