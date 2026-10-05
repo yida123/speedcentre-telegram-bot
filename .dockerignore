@@ -1,6 +1,8 @@
 .git
 .venv
 .env
+subscriptions.yaml
+data
 __pycache__
 .pytest_cache
 tests

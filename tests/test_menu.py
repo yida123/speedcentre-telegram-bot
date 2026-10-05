@@ -1,8 +1,16 @@
 import asyncio
+from types import SimpleNamespace
 
-from bot.config import Config
+import pytest
+from telegram.ext import ApplicationHandlerStop
+
+from bot.config import Config, load_subscriptions
 from bot.formatter import build_plan
-from bot.main import Selection, SpeedBot
+from bot.main import SpeedBot, TaskView
+from bot.quota import DailyQuota
+
+SUBS = [("3399", "trojan://pw@hk.com:443#HK"), ("IPLC", "trojan://pw@jp.com:443#JP")]
+TASK_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def test_build_plan():
@@ -10,38 +18,38 @@ def test_build_plan():
     types = [m["Type"] for m in plan.matrices]
     assert types == ["TEST_PING_RTT", "SPEED_AVERAGE", "SPEED_MAX", "SPEED_PER_SECOND",
                      "GEOIP_INBOUND", "GEOIP_OUTBOUND", "TEST_SCRIPT"]
-    assert plan.matrices[-1]["Params"] == "INTERNAL::netflix"
     assert plan.views == ("normalview", "topologyview") and plan.sort == "avg_speed_desc"
-    assert build_plan("t", {"geo"}).views == ("topologyview",)
 
 
 class FakeUser:
     def __init__(self, uid):
-        self.id, self.full_name = uid, f"u{uid}"
+        self.id, self.full_name, self.is_bot = uid, f"u{uid}", False
 
     def mention_html(self):
         return f"<a>u{self.id}</a>"
 
 
 class FakeMessage:
-    def __init__(self, chat_id=-100):
-        self.chat_id = chat_id
-        self.edits, self.photos, self.deleted = [], [], False
-
-    async def delete(self):
-        self.deleted = True
+    def __init__(self, chat_id=-100, text=""):
+        self.chat_id, self.text, self.caption = chat_id, text, None
+        self.edits, self.replies, self.photos, self.photo_markups = [], [], [], []
+        self.deleted = False
+        self.reply_to_message = None
 
     async def edit_text(self, text, **kw):
         self.edits.append((text, kw.get("reply_markup")))
 
-    async def reply_photo(self, photo, caption=None, **kw):
-        self.photos.append(caption)
-        self.photo_markups = getattr(self, "photo_markups", []) + [kw.get("reply_markup")]
-
     async def reply_text(self, text, **kw):
         m = FakeMessage(self.chat_id)
-        self.replies = getattr(self, "replies", []) + [(text, kw.get("reply_markup"), m)]
+        self.replies.append((text, kw.get("reply_markup"), m))
         return m
+
+    async def reply_photo(self, photo, caption=None, **kw):
+        self.photos.append(caption)
+        self.photo_markups.append(kw.get("reply_markup"))
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeQuery:
@@ -54,42 +62,29 @@ class FakeQuery:
 
 class FakeAPI:
     def __init__(self):
-        self.submitted = None
-
-    async def list_scripts(self):
-        return [{"id": "nf", "name": "Netflix", "type": "media"}, {"id": "ip1", "name": "IP", "type": "ip"}]
+        self.submitted = self.slave_id = self.sort = self.shared = None
 
     async def list_backends(self):
         return [
-            {"client_id": "hk", "display_name": "香港 HKT", "is_online": True, "allow_public_access": True,
-             "speed_pending": 3, "conn_pending": 0},
-            {"client_id": "jp", "display_name": "日本 IIJ", "is_online": True, "speed_pending": 0, "conn_pending": 1},
-            {"client_id": "us", "display_name": "美国", "is_online": False},
-            {"client_id": "priv", "display_name": "私有", "is_online": True, "allow_public_access": False},
+            {"client_id": "SHCT", "display_name": "上海电信@2Gbps", "is_online": True, "allow_public_access": True},
+            {"client_id": "DGCT", "display_name": "东莞电信@1Gbps", "is_online": True},
+            {"client_id": "US", "display_name": "美国", "is_online": False},
+            {"client_id": "PRIV", "display_name": "私有", "is_online": True, "allow_public_access": False},
         ]
 
     async def submit_task(self, name, nodes, matrices, slave_id=None):
-        self.submitted = (name, matrices)
-        self.slave_id = slave_id
-        return {"task_id": "11111111-1111-1111-1111-111111111111", "status": "pending"}
+        self.submitted, self.slave_id = (name, nodes, matrices), slave_id
+        return {"task_id": TASK_ID, "status": "pending"}
 
     async def get_task(self, task_id):
-        return {"status": "completed", "credit_cost": 3}
+        return {"status": "completed", "slave_name": "上海电信@2Gbps", "duration_ms": 42000}
 
     async def get_result(self, task_id):
         return {"result": {"Results": []}}
 
     async def export_image(self, task_id, view, sort=None):
         self.sort = sort
-        return b"img-" + view.encode()
-
-    async def list_profiles(self):
-        return [{"uuid": "u-1", "name": "3399", "url": "trojan://pw@hk.com:443#HK", "is_active": True},
-                {"uuid": "u-2", "name": "old", "url": "trojan://pw@jp.com:443#JP", "is_active": False}]
-
-    async def create_profile(self, name, url):
-        self.created = (name, url)
-        return {"uuid": "u-3", "name": name}
+        return b"img"
 
     async def create_share(self, task_id, title, hide_private_info=True):
         self.shared = (task_id, title, hide_private_info)
@@ -104,16 +99,8 @@ class FakeBot:
 
     async def send_message(self, chat_id, text, **kw):
         m = FakeMessage(chat_id)
-        self.sent.append((chat_id, text, kw.get("reply_markup"), m))
+        self.sent.append((chat_id, text, m))
         return m
-
-    async def get_chat_member(self, chat_id, user_id):
-        from types import SimpleNamespace
-        return SimpleNamespace(status="member" if user_id == 1 else "left")
-
-    async def get_chat(self, chat_id):
-        from types import SimpleNamespace
-        return SimpleNamespace(title="测速群")
 
 
 class FakeApp:
@@ -131,292 +118,229 @@ class FakeContext:
         self.bot = self.application.bot
         self.args = args or []
 
+    async def run_tasks(self):
+        for t in self.application.tasks:
+            await t
+        self.application.tasks = []
+
+
+def make_bot(tmp_path, **kw):
+    kw.setdefault("subscriptions", SUBS)
+    kw.setdefault("allowed_chat_ids", {-100})
+    bot = SpeedBot(Config(bot_token="t", api_key="k", data_dir=str(tmp_path), **kw))
+    bot.api = FakeAPI()
+    return bot
+
+
+def update(text, user_id=1, chat_id=-100, chat_type="supergroup"):
+    msg = FakeMessage(chat_id, text)
+    upd = SimpleNamespace(effective_message=msg, effective_user=FakeUser(user_id),
+                          effective_chat=SimpleNamespace(id=chat_id, type=chat_type))
+    return upd, msg
+
 
 def buttons(markup):
     return [b.text for row in markup.inline_keyboard for b in row]
 
 
-def test_menu_flow():
+async def speed(bot, text="/speed", user_id=1):
+    upd, msg = update(text, user_id)
+    ctx = FakeContext(text.split()[1:])
+    await bot.cmd_speed(upd, ctx)
+    return msg, ctx
+
+
+async def click(bot, data, user_id=1, ctx=None):
+    q = FakeQuery(data, user_id)
+    await bot._on_select(q, ctx or FakeContext())
+    return q
+
+
+def test_full_flow_pick_sub_backend_sort(tmp_path):
     async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", admin_user_ids={99}))
-        bot.api = FakeAPI()
-        status = FakeMessage()
-        sel = Selection(owner=FakeUser(1), chat_id=-100, target_title="g", status=status, nodes=[{"Name": "n"}],
-                        skipped=0,
-                        name_filter=None, slave=None, options={"rtt"})
-        bot.selections["ab"] = sel
-        ctx = FakeContext()
+        bot = make_bot(tmp_path, share_url="https://scp.example/share/{uuid}")
+        msg, ctx = await speed(bot)
+        status = msg.replies[-1][2]
+        text, markup = status.edits[-1]
+        assert "选择要测速的订阅" in text and buttons(markup) == ["3399", "IPLC", "❌ 终止操作"]
+        sid = next(iter(bot.selections))
 
-        await bot._on_select(FakeQuery("sel:ab:t:speed", 1), ctx)
-        assert sel.options == {"rtt", "speed"}
-        assert "✅ 测速" in buttons(status.edits[-1][1])
+        await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        text, markup = status.edits[-1]
+        assert "选择测速后端" in text and "任务：<b>3399</b>" in text
+        assert buttons(markup) == ["🤖 自动选择", "上海电信@2Gbps (SHCT)", "东莞电信@1Gbps (DGCT)", "❌ 终止操作"]
 
-        q = FakeQuery("sel:ab:t:udp", 2)  # 非发起人不能操作
-        await bot._on_select(q, ctx)
-        assert sel.options == {"rtt", "speed"} and q.answers == ["只有发起人可以操作。"]
+        await click(bot, f"sel:{sid}:b:0", ctx=ctx)
+        text, markup = status.edits[-1]
+        assert "选择排序方式" in text and "选中后端：<b>SHCT</b>" in text
+        assert buttons(markup) == ["📋 订阅顺序（默认）", "🀄 节点名（升序）", "🚀 平均速度（升序）", "🚀 平均速度（降序）",
+                                   "❌ 终止操作"]
+        assert bot.api.submitted is None
 
-        await bot._on_select(FakeQuery("sel:ab:scripts", 1), ctx)
-        assert sel.script_list == [("nf", "Netflix")]
-        await bot._on_select(FakeQuery("sel:ab:s:0", 1), ctx)
-        assert sel.scripts == {"nf"}
-        await bot._on_select(FakeQuery("sel:ab:t:geo", 99), ctx)  # 管理员可以操作
-        await bot._on_select(FakeQuery("sel:ab:go", 1), ctx)
+        await click(bot, f"sel:{sid}:o:3", ctx=ctx)
+        name, nodes, matrices = bot.api.submitted
+        assert name.startswith("3399 · 测速") and nodes[0]["Name"] == "HK" and bot.api.slave_id == "SHCT"
+        assert [m["Type"] for m in matrices] == ["TEST_PING_RTT", "SPEED_AVERAGE", "SPEED_MAX", "SPEED_PER_SECOND"]
+        assert sid not in bot.selections
 
-        name, matrices = bot.api.submitted
-        assert name.startswith("临时订阅 · 自定义测试")
-        assert {"Type": "TEST_SCRIPT", "Params": "INTERNAL::nf"} in matrices
-        assert "ab" not in bot.selections
-
-        await ctx.application.tasks[0]
-        assert len(status.photos) == 2 and status.photos[1] is None  # normalview + topologyview
+        await ctx.run_tasks()
+        assert bot.api.sort == "avg_speed_desc"
+        caption = status.photos[0]
+        assert "✅ 任务 <b>3399</b> 已完成" in caption and "<a>u1</a>" in caption and "今日剩余 2 次" in caption
+        assert status.photo_markups[0].inline_keyboard[0][0].url == "https://scp.example/share/share-1"
         assert bot.running[-100] == set()
 
-        q = FakeQuery("sel:ab:go", 1)  # 已提交后菜单失效
-        await bot._on_select(q, ctx)
+    asyncio.run(run())
+
+
+def test_named_sub_without_pickers_uses_default_sort(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+        msg, ctx = await speed(bot, "/speed iplc")  # 订阅名不区分大小写
+        assert bot.api.submitted[0].startswith("IPLC · 测速") and bot.api.slave_id is None
+        await ctx.run_tasks()
+        assert bot.api.sort == "avg_speed_desc"
+
+    asyncio.run(run())
+
+
+def test_single_sub_and_subscription_order(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1])
+        msg, ctx = await speed(bot)
+        status = msg.replies[-1][2]
+        assert "选择测速后端" in status.edits[-1][0]  # 只有一个订阅时跳过订阅选择
+        sid = next(iter(bot.selections))
+        await click(bot, f"sel:{sid}:b:auto", ctx=ctx)
+        await click(bot, f"sel:{sid}:o:0", ctx=ctx)  # 订阅顺序
+        await ctx.run_tasks()
+        assert bot.api.slave_id is None and bot.api.sort is None
+
+    asyncio.run(run())
+
+
+def test_daily_limit_and_admin_unlimited(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, daily_limit=1, admin_user_ids={9}, backend_select=False, sort_select=False)
+        _, ctx = await speed(bot, "/speed 3399")
+        assert bot.api.submitted
+        await ctx.run_tasks()
+
+        bot.api.submitted = None
+        msg, _ = await speed(bot, "/speed 3399")
+        assert "1 次测速已用完" in msg.replies[-1][0] and bot.api.submitted is None
+
+        for _ in range(3):  # 管理员不限次数
+            bot.api.submitted = None
+            _, ctx = await speed(bot, "/speed 3399", user_id=9)
+            assert bot.api.submitted
+            await ctx.run_tasks()
+
+        # 次数持久化：重启后仍然记得
+        assert DailyQuota(str(tmp_path / "usage.json"), 1).remaining(1) == 0
+
+    asyncio.run(run())
+
+
+def test_terminate_does_not_consume_quota(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        msg, ctx = await speed(bot)
+        sid = next(iter(bot.selections))
+        await click(bot, f"sel:{sid}:x", ctx=ctx)
+        assert "已终止" in msg.replies[-1][2].edits[-1][0] and not bot.selections
+        assert bot.quota.remaining(1) == 3
+
+    asyncio.run(run())
+
+
+def test_only_owner_can_click_and_expiry(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        await speed(bot)
+        sid = next(iter(bot.selections))
+        q = await click(bot, f"sel:{sid}:u:0", user_id=2)
+        assert q.answers == ["只有发起人可以操作。"] and bot.selections[sid].sub is None
+        bot.selections[sid].created -= 10_000
+        q = await click(bot, f"sel:{sid}:u:0")
         assert "过期" in q.answers[0]
 
     asyncio.run(run())
 
 
-def test_dm_submission_posts_to_group():
+def test_rejects_links_unknown_subs_and_private(tmp_path):
     async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k"))
-        bot.api = FakeAPI()
-        dm_status = FakeMessage(chat_id=1)
-        sel = Selection(owner=FakeUser(1), chat_id=-100, target_title="测速群", status=dm_status,
-                        nodes=[{"Name": "n"}], skipped=0, name_filter=None, slave=None, options={"rtt"})
-        bot.selections["cd"] = sel
-        ctx = FakeContext()
-        await bot._on_select(FakeQuery("sel:cd:go", 1), ctx)
+        bot = make_bot(tmp_path)
+        msg, ctx = await speed(bot, "/speed https://a.com/sub?token=1")
+        assert msg.deleted and "只测速固定订阅" in ctx.bot.sent[-1][1] and bot.api.submitted is None
 
-        assert "已提交" in dm_status.edits[-1][0] and "测速群" in dm_status.edits[-1][0]
-        chat_id, text, _, group_msg = ctx.bot.sent[0]
-        assert chat_id == -100 and "<a>u1</a>" in text  # 群消息 @ 发起人
-        await ctx.application.tasks[0]
-        assert group_msg.photos and "<a>u1</a>" in group_msg.photos[0]  # 结果图发在群里
-        assert not dm_status.photos
+        msg, _ = await speed(bot, "/speed nope")
+        assert "未找到订阅" in msg.replies[-1][0] and "<code>3399</code>" in msg.replies[-1][0]
+
+        upd, msg = update("/speed", chat_type="private", chat_id=1)
+        await bot.cmd_speed(upd, FakeContext())
+        assert "群组" in msg.replies[-1][0] and not bot.selections
+
+        upd, msg = update("/speed", chat_id=-200)
+        await bot.cmd_speed(upd, FakeContext())
+        assert "未授权" in msg.replies[-1][0]
 
     asyncio.run(run())
 
 
-class FakeUpdate:
-    def __init__(self, msg, chat_id, chat_type, user):
-        from types import SimpleNamespace
-        self.effective_message = msg
-        self.effective_chat = SimpleNamespace(id=chat_id, type=chat_type)
-        self.effective_user = user
-
-
-def test_group_sub_link_deleted_and_redirected():
-    from telegram.ext import ApplicationHandlerStop
-    import pytest
-
+def test_group_sub_link_deleted(tmp_path):
     async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
+        bot = make_bot(tmp_path)
+        upd, msg = update("我的订阅 https://airport.example/api/v1/client/subscribe?token=abc")
         ctx = FakeContext()
-        user = FakeUser(1)
-        user.is_bot = False
-
-        msg = FakeMessage()
-        msg.text, msg.caption = "我的订阅 https://airport.example/api/v1/client/subscribe?token=abc", None
         with pytest.raises(ApplicationHandlerStop):
-            await bot.on_group_message(FakeUpdate(msg, -100, "supergroup", user), ctx)
-        assert msg.deleted
-        chat_id, text, markup, _ = ctx.bot.sent[0]
-        assert chat_id == -100 and "已删除" in text
-        assert markup.inline_keyboard[0][0].url == "https://t.me/speedbot?start=g-100_test"
+            await bot.on_group_message(upd, ctx)
+        assert msg.deleted and "已删除" in ctx.bot.sent[0][1]
 
-        normal = FakeMessage()
-        normal.text, normal.caption = "看看 https://github.com/foo/bar", None
-        await bot.on_group_message(FakeUpdate(normal, -100, "supergroup", user), ctx)
+        upd, normal = update("看看 https://github.com/foo/bar")
+        await bot.on_group_message(upd, ctx)
         assert not normal.deleted
-        for t in ctx.application.tasks:  # 引导消息的定时删除协程
+        for t in ctx.application.tasks:  # 提示消息的定时删除协程
             t.close()
 
     asyncio.run(run())
 
 
-def test_start_deep_link_requires_membership():
+def test_sub_command_lists_names_and_quota(tmp_path):
     async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
-        replies = []
-
-        class DM(FakeMessage):
-            async def reply_text(self, text, **kw):
-                replies.append(text)
-
-        await bot.cmd_start(FakeUpdate(DM(1), 1, "private", FakeUser(1)), FakeContext(["g-100_speed"]))
-        assert bot.dm_targets[1].chat_id == -100 and bot.dm_targets[1].command == "speed"
-        assert "测速群" in replies[-1]
-
-        await bot.cmd_start(FakeUpdate(DM(2), 2, "private", FakeUser(2)), FakeContext(["g-100_test"]))
-        assert 2 not in bot.dm_targets and "不是该群成员" in replies[-1]
-
-        await bot.cmd_start(FakeUpdate(DM(1), 1, "private", FakeUser(1)), FakeContext(["g-999_test"]))
-        assert "未授权" in replies[-1]
-
-    asyncio.run(run())
-
-
-def test_selectable_backends_filter_and_order():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k"))
-        bot.api = FakeAPI()
-        backends = await bot._selectable_backends()
-        assert [b["client_id"] for b in backends] == ["hk", "jp"]  # 离线、不允许调用的被排除，保持 API 顺序
-        assert SpeedBot._match_backend(backends, "香港 hkt")["client_id"] == "hk"
-        assert SpeedBot._match_backend(backends, "us") is None
-
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_backends={"hk"}))
-        bot.api = FakeAPI()
-        assert [b["client_id"] for b in await bot._selectable_backends()] == ["hk"]
-
-    asyncio.run(run())
-
-
-def make_sel(bot, **kw):
-    return Selection(owner=FakeUser(1), chat_id=-100, target_title="g", status=FakeMessage(), nodes=[{"Name": "n"}],
-                     skipped=0, name_filter=None, slave=None, **kw)
-
-
-def test_quick_command_picks_backend_then_sort_then_submits():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k"))
-        bot.api = FakeAPI()
-        sel = make_sel(bot, options={"rtt", "speed"}, backends=await bot._selectable_backends(), quick="speed",
-                       page="backends", label="3399")
-        bot.selections["q1"] = sel
-        ctx = FakeContext()
-
-        await bot._render_menu("q1", sel)
-        text, markup = sel.status.edits[-1]
-        assert "选择测速后端" in text and "任务：<b>3399</b>" in text
-        assert buttons(markup) == ["✅ 🤖 自动选择", "香港 HKT (hk)", "日本 IIJ (jp)", "❌ 终止操作"]
-
-        await bot._on_select(FakeQuery("sel:q1:b:0", 1), ctx)  # 香港
-        text, markup = sel.status.edits[-1]
-        assert "选择排序方式" in text and "选中后端：<b>hk</b>" in text
-        assert buttons(markup) == ["📋 订阅顺序（默认）", "🀄 节点名（升序）", "🚀 平均速度（升序）", "🚀 平均速度（降序）",
-                                   "⏱ 延迟（升序）", "⏱ 延迟（降序）", "❌ 终止操作"]
-        assert bot.api.submitted is None
-
-        await bot._on_select(FakeQuery("sel:q1:o:0", 1), ctx)  # 订阅顺序
-        assert bot.api.slave_id == "hk" and bot.api.submitted[0].startswith("3399 · 测速")
-        await ctx.application.tasks[0]
-        assert bot.api.sort is None  # 订阅顺序：不传 sort
-        assert "✅ 任务 <b>3399</b> 已完成" in sel.status.photos[0]
-
-    asyncio.run(run())
-
-
-def test_menu_backend_page_and_pagination():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k"))
-        bot.api = FakeAPI()
-        many = [{"client_id": f"b{i}", "display_name": f"B{i}", "is_online": True} for i in range(10)]
-
-        async def list_backends():
-            return many
-        bot.api.list_backends = list_backends
-        sel = make_sel(bot, options={"rtt"})
-        bot.selections["m1"] = sel
-        ctx = FakeContext()
-
-        await bot._on_select(FakeQuery("sel:m1:backends", 1), ctx)
-        labels = buttons(sel.status.edits[-1][1])
-        assert labels[-2:] == ["下一页", "◂ 返回"] and "1/2" in labels and "·" in labels
-        await bot._on_select(FakeQuery("sel:m1:bp:1", 1), ctx)
-        assert "B9 (b9)" in buttons(sel.status.edits[-1][1])
-        await bot._on_select(FakeQuery("sel:m1:b:9", 1), ctx)
-        assert sel.slave == "b9" and sel.page == "main"
-        assert "🖥 后端：B9 ▸" in buttons(sel.status.edits[-1][1])
-
-        await bot._on_select(FakeQuery("sel:m1:go", 1), ctx)
-        assert bot.api.slave_id == "b9"
-        for t in ctx.application.tasks:
-            t.close()
-
-    asyncio.run(run())
-
-
-def group_update(text, user_id=1):
-    msg = FakeMessage(-100)
-    msg.text, msg.caption, msg.chat = text, None, None
-    user = FakeUser(user_id)
-    user.is_bot = False
-    upd = FakeUpdate(msg, -100, "supergroup", user)
-    upd.effective_chat.title = "测速群"
-    return upd, msg
-
-
-def test_group_speed_by_profile_name_with_share():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100},
-                              task_url="https://scp.example/task/{task_id}",
-                              share_url="https://scp.example/share/{uuid}"))
-        bot.api = FakeAPI()
-        upd, msg = group_update("/speed 3399")
-        ctx = FakeContext(["3399"])
-        await bot.cmd_test(upd, ctx)
-
-        status = msg.replies[-1][2]  # 选择菜单直接在群里，回复发起人的消息
-        assert "选择测速后端" in status.edits[-1][0]
-        sid = next(iter(bot.selections))
-        await bot._on_select(FakeQuery(f"sel:{sid}:b:auto", 1), ctx)
-        await bot._on_select(FakeQuery(f"sel:{sid}:o:3", 1), ctx)  # 平均速度（降序）
-        assert bot.api.slave_id is None and bot.api.submitted[0].startswith("3399 · 测速")
-
-        await ctx.application.tasks[0]
-        assert bot.api.sort == "avg_speed_desc"
-        assert bot.api.shared == ("11111111-1111-1111-1111-111111111111", "3399", True)
-        share_button = status.photo_markups[0].inline_keyboard[0][0]
-        assert share_button.text == "📊 查看详情" and share_button.url == "https://scp.example/share/share-1"
-        assert "<a>u1</a>" in status.photos[0]  # 结果 @ 发起人
-
-    asyncio.run(run())
-
-
-def test_group_unknown_or_inactive_profile():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}))
-        bot.api = FakeAPI()
-        for name in ("nope", "old"):
-            upd, msg = group_update(f"/speed {name}")
-            await bot.cmd_test(upd, FakeContext([name]))
-            text, markup, _ = msg.replies[-1]
-            assert "未找到订阅" in text and markup.inline_keyboard[0][0].url.startswith("https://t.me/speedbot?start=")
-        assert not bot.selections
+        bot = make_bot(tmp_path)
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        text = msg.replies[-1][0]
+        assert "<code>3399</code>" in text and "<code>IPLC</code>" in text and "trojan" not in text
+        assert "还可以测速 3/3 次" in text
 
     asyncio.run(run())
 
 
 def test_progress_text():
-    from bot.formatter import build_plan
-    from bot.main import TaskView
-    v = TaskView("tid", "3399", "测速 · @u\n节点 2 个\nID <code>tid</code>", "自动选择", build_plan("测速", {"speed"}))
+    v = TaskView("tid", "3399", "发起人 @u · 节点 2 个\nID <code>tid</code>", "自动选择", None)
     assert SpeedBot._task_text(v, "pending").startswith("⏳ 任务 <b>3399</b> 准备中…")
     running = SpeedBot._task_text(v, "running", 1, 4, backend="上海电信")
     assert running.startswith("⚡ 任务 <b>3399</b> 进行中…\n<code>[████░░░░░░░░░░░░]</code> 25%")
-    assert running.endswith("后端 上海电信")
+    assert "后端 上海电信 · 发起人" in running
 
 
-def test_sub_command():
-    async def run():
-        bot = SpeedBot(Config(bot_token="t", api_key="k", allowed_chat_ids={-100}, admin_user_ids={9}))
-        bot.api = FakeAPI()
+def test_quota_resets_daily(tmp_path):
+    q = DailyQuota(str(tmp_path / "u.json"), 3)
+    q._today = lambda: "2026-10-05"
+    assert [q.consume(1) for _ in range(3)] == [2, 1, 0] and q.remaining(1) == 0 and q.remaining(2) == 3
+    q._today = lambda: "2026-10-06"
+    assert q.remaining(1) == 3
+    assert DailyQuota(str(tmp_path / "x.json"), 0).consume(1) is None  # 0 表示不限
 
-        upd, msg = group_update("/sub")
-        await bot.cmd_sub(upd, FakeContext([]))
-        listing = msg.replies[-1][0]
-        assert "<code>3399</code>" in listing and "old" not in listing and "trojan" not in listing
 
-        upd, msg = group_update("/sub add x https://a.com/sub")
-        await bot.cmd_sub(upd, FakeContext(["add", "x", "https://a.com/sub"]))
-        assert "只有管理员" in msg.replies[-1][0]
-
-        dm = FakeMessage(9)
-        admin = FakeUser(9)
-        await bot.cmd_sub(FakeUpdate(dm, 9, "private", admin), FakeContext(["add", "新订阅", "https://a.com/sub"]))
-        assert bot.api.created == ("新订阅", "https://a.com/sub") and "已添加" in dm.replies[-1][0]
-
-    asyncio.run(run())
+def test_load_subscriptions(tmp_path):
+    p = tmp_path / "s.yaml"
+    p.write_text("subscriptions:\n  - name: 3399\n    url: https://a.com/sub\n", encoding="utf-8")
+    assert load_subscriptions(str(p)) == [("3399", "https://a.com/sub")]  # 数字名称转为字符串
+    p.write_text("subscriptions:\n  - name: a\n    url: x\n  - name: a\n    url: y\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="重复"):
+        load_subscriptions(str(p))
+    with pytest.raises(SystemExit, match="找不到"):
+        load_subscriptions(str(tmp_path / "missing.yaml"))

@@ -9,11 +9,13 @@ User=speedbot
 Group=speedbot
 WorkingDirectory=__APP_DIR__
 ExecStart=__APP_DIR__/.venv/bin/python -m bot.main
-Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 DATA_DIR=/var/lib/speed-bot
+# 测速次数记录保存在 /var/lib/speed-bot，重启不清零
+StateDirectory=speed-bot
 Restart=always
 RestartSec=5
 
-# 安全加固：bot 不需要写任何文件
+# 安全加固：除 StateDirectory 外 bot 不需要写任何文件
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
