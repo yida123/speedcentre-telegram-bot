@@ -1,0 +1,8 @@
+# 群里可以测速的固定订阅。复制为 subscriptions.yaml 后填写真实地址。
+# name：群里使用的名称（/speed 名称），url：订阅链接或节点分享链接。
+# 这个文件包含订阅地址，请勿公开。
+subscriptions:
+  - name: "3399"
+    url: https://example.com/api/v1/client/subscribe?token=xxxxxxxx
+  # - name: "IPLC"
+  #   url: https://example.com/api/v1/client/subscribe?token=yyyyyyyy

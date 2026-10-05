@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass, field
 
+import yaml
+
 
 def _load_dotenv(path: str = ".env") -> None:
     """极简 .env 读取，避免额外依赖。已存在的环境变量优先。"""
@@ -23,20 +25,47 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def load_subscriptions(path: str) -> list[tuple[str, str]]:
+    """读取固定测试的订阅 [(名称, 订阅链接)]。"""
+    if not os.path.isfile(path):
+        raise SystemExit(f"找不到订阅配置文件 {path}（可参考 subscriptions.example.yaml）")
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    subs: list[tuple[str, str]] = []
+    for i, item in enumerate(data.get("subscriptions") or [], 1):
+        name, url = str((item or {}).get("name") or "").strip(), str((item or {}).get("url") or "").strip()
+        if not name or not url:
+            raise SystemExit(f"{path} 第 {i} 个订阅缺少 name 或 url")
+        if any(name == n for n, _ in subs):
+            raise SystemExit(f"{path} 中订阅名「{name}」重复")
+        subs.append((name, url))
+    if not subs:
+        raise SystemExit(f"{path} 中没有配置任何订阅")
+    return subs
+
+
 @dataclass
 class Config:
     bot_token: str
     api_key: str
     api_base: str = "https://api.speedcentre.plus"
+    subscriptions: list[tuple[str, str]] = field(default_factory=list)
+    daily_limit: int = 3
+    data_dir: str = "data"
+    timezone: str = "Asia/Shanghai"
     allowed_chat_ids: set[int] = field(default_factory=set)
     admin_user_ids: set[int] = field(default_factory=set)
     allow_private: bool = False
     max_nodes: int = 100
     max_tasks_per_chat: int = 1
     default_slave_id: str = ""
+    allowed_backends: set[str] = field(default_factory=set)
+    backend_select: bool = True
+    sort_select: bool = True
+    task_url: str = ""
+    share_url: str = ""
     delete_sub_message: bool = True
     sub_link_pattern: str = ""
-    dm_target_ttl: float = 1800.0
     poll_interval: float = 5.0
     task_timeout: float = 1800.0
 
@@ -51,12 +80,21 @@ class Config:
             bot_token=token,
             api_key=api_key,
             api_base=os.environ.get("SCP_API_BASE", cls.api_base).rstrip("/"),
+            subscriptions=load_subscriptions(os.environ.get("SUBSCRIPTIONS_FILE", "subscriptions.yaml")),
+            daily_limit=int(os.environ.get("DAILY_LIMIT", "3")),
+            data_dir=os.environ.get("DATA_DIR", "data"),
+            timezone=os.environ.get("TIMEZONE", "Asia/Shanghai"),
             allowed_chat_ids=_int_set(os.environ.get("ALLOWED_CHAT_IDS", "")),
             admin_user_ids=_int_set(os.environ.get("ADMIN_USER_IDS", "")),
             allow_private=_bool(os.environ.get("ALLOW_PRIVATE", "false")),
             max_nodes=int(os.environ.get("MAX_NODES", "100")),
             max_tasks_per_chat=int(os.environ.get("MAX_TASKS_PER_CHAT", "1")),
             default_slave_id=os.environ.get("DEFAULT_SLAVE_ID", ""),
+            allowed_backends={x for x in os.environ.get("ALLOWED_BACKENDS", "").replace(" ", "").split(",") if x},
+            backend_select=_bool(os.environ.get("BACKEND_SELECT", "true")),
+            sort_select=_bool(os.environ.get("SORT_SELECT", "true")),
+            task_url=os.environ.get("SCP_TASK_URL", ""),
+            share_url=os.environ.get("SCP_SHARE_URL", ""),
             delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "true")),
             sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),

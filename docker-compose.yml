@@ -3,6 +3,11 @@ services:
     build: .
     container_name: speed_bot
     env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - ./subscriptions.yaml:/app/subscriptions.yaml:ro
+      - speed-bot-data:/app/data  # 测速次数记录，重建容器不清零
     restart: unless-stopped
     read_only: true
     logging:
@@ -10,3 +15,6 @@ services:
       options:
         max-size: 10m
         max-file: "3"
+
+volumes:
+  speed-bot-data:

@@ -37,9 +37,13 @@ if [[ ! -f "$APP_DIR/.env" ]]; then
     cp "$APP_DIR/.env.example" "$APP_DIR/.env"
     NEW_ENV=1
 fi
-# .env 里有 Token 和 API Key，只允许服务用户读取
+if [[ ! -f "$APP_DIR/subscriptions.yaml" ]]; then
+    cp "$APP_DIR/subscriptions.example.yaml" "$APP_DIR/subscriptions.yaml"
+    NEW_ENV=1
+fi
+# .env 和订阅配置里有 Token、API Key 和订阅地址，只允许服务用户读取
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
-chmod 600 "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env" "$APP_DIR/subscriptions.yaml"
 
 echo ">> 安装 systemd 服务"
 sed "s#__APP_DIR__#$APP_DIR#g" "$APP_DIR/deploy/speed-bot.service" > "/etc/systemd/system/$SERVICE.service"
@@ -48,7 +52,10 @@ systemctl enable "$SERVICE" >/dev/null
 
 if [[ -n "${NEW_ENV:-}" ]]; then
     echo
-    echo "已生成配置文件 $APP_DIR/.env，请先填写 TG_BOT_TOKEN、SCP_API_KEY、ALLOWED_CHAT_IDS，然后执行："
+    echo "已生成配置文件，请先填写："
+    echo "    $APP_DIR/.env                （TG_BOT_TOKEN、SCP_API_KEY、ADMIN_USER_IDS）"
+    echo "    $APP_DIR/subscriptions.yaml  （要测速的订阅名称和地址）"
+    echo "然后执行："
     echo "    sudo systemctl start $SERVICE"
     exit 0
 fi

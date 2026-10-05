@@ -73,6 +73,10 @@ class SCPClient:
     async def list_scripts(self) -> list[dict]:
         return await self._request("GET", "/api/v1/scripts") or []
 
+    async def create_share(self, task_id: str, title: str, hide_private_info: bool = True) -> dict:
+        return await self._request("POST", f"/api/v1/tasks/{task_id}/share",
+                                   json={"title": title[:128], "hide_private_info": hide_private_info})
+
     async def list_tasks(self, page: int = 1, page_size: int = 10, status: str | None = None) -> dict:
         params: dict[str, Any] = {"page": page, "page_size": page_size}
         if status:
