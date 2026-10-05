@@ -270,12 +270,12 @@ class SpeedBot:
 
         status = await msg.reply_text("📥 正在解析节点…")
 
-        # 订阅链接属于敏感信息，按配置删除原消息
-        if self.cfg.delete_sub_message and subs and not from_reply:
+        # 订阅链接属于敏感信息，按配置删除含链接的消息（回复模式下是被回复的那条）
+        if self.cfg.delete_sub_message and subs:
             try:
-                await msg.delete()
-            except TelegramError:
-                pass
+                await (msg.reply_to_message if from_reply else msg).delete()
+            except TelegramError as e:
+                log.warning("删除含订阅链接的消息失败（bot 需要删除消息权限）：%s", e)
 
         proxies: list[dict] = []
         errors: list[str] = []

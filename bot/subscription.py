@@ -2,10 +2,14 @@
 
 API 的 Node.Payload 是单个节点的 Clash YAML，所以这里统一先转成 Clash 的 proxy dict。
 """
+import asyncio
 import base64
+import ipaddress
 import json
 import re
-from urllib.parse import parse_qs, unquote, urlsplit
+import socket
+import urllib.request
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 import yaml
@@ -292,16 +296,81 @@ def parse_content(text: str) -> list[dict]:
     return proxies
 
 
-async def fetch_subscription(url: str, timeout: float = 30.0) -> list[dict]:
-    headers = {"User-Agent": "clash.meta"}
+MAX_REDIRECTS = 5
+MAX_SUB_SIZE = 10 * 1024 * 1024
+
+
+def _is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+async def _resolve(host: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(info[4][0] for info in infos))
+
+
+async def _public_ip(host: str, port: int) -> str:
+    """解析主机并确认所有地址都是公网地址，防止通过订阅链接访问内网（SSRF）。"""
     try:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            resp = await client.get(url, headers=headers)
-    except httpx.HTTPError as e:
-        raise SubscriptionError(f"获取订阅失败：{type(e).__name__}") from e
-    if resp.status_code != 200:
-        raise SubscriptionError(f"获取订阅失败：HTTP {resp.status_code}")
-    return parse_content(resp.text)
+        addrs = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:
+            addrs = [ipaddress.ip_address(a.split("%")[0]) for a in await _resolve(host, port)]
+        except OSError as e:
+            raise SubscriptionError("获取订阅失败：无法解析域名") from e
+    if not addrs:
+        raise SubscriptionError("获取订阅失败：无法解析域名")
+    if not all(_is_public(a) for a in addrs):
+        raise SubscriptionError("获取订阅失败：不允许访问内网或保留地址")
+    return str(addrs[0])
+
+
+def _uses_proxy(url: str) -> bool:
+    """与 httpx 一样读取 HTTP(S)_PROXY / NO_PROXY 环境变量，判断该 URL 是否会经过代理。"""
+    u = urlsplit(url)
+    proxies = urllib.request.getproxies()
+    return bool(proxies.get(u.scheme) or proxies.get("all")) and not urllib.request.proxy_bypass(u.hostname or "")
+
+
+async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.AsyncBaseTransport | None = None) -> list[dict]:
+    """拉取订阅。每一跳（含重定向）都校验目标地址，并直接连接校验过的 IP，避免 DNS 重绑定。"""
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=transport) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            u = urlsplit(url)
+            if u.scheme not in ("http", "https") or not u.hostname:
+                raise SubscriptionError("获取订阅失败：仅支持 http/https 链接")
+            try:
+                port = u.port or (443 if u.scheme == "https" else 80)
+            except ValueError as e:
+                raise SubscriptionError("获取订阅失败：端口无效") from e
+            ip = await _public_ip(u.hostname, port)
+            headers = {"User-Agent": "clash.meta"}
+            extensions = {}
+            target = url
+            if not _uses_proxy(url):
+                # 直连时连接已校验的 IP，避免校验后 DNS 被重绑定到内网；走代理时由代理解析域名，无法固定 IP
+                ip_host = f"[{ip}]" if ":" in ip else ip
+                target = urlunsplit((u.scheme, f"{ip_host}:{port}", u.path or "/", u.query, ""))
+                headers["Host"] = u.hostname if u.port is None else f"{u.hostname}:{u.port}"
+                extensions["sni_hostname"] = u.hostname
+            try:
+                async with client.stream("GET", target, headers=headers, extensions=extensions) as resp:
+                    if resp.is_redirect and resp.headers.get("location"):
+                        url = urljoin(url, resp.headers["location"])
+                        continue
+                    if resp.status_code != 200:
+                        raise SubscriptionError(f"获取订阅失败：HTTP {resp.status_code}")
+                    body = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        body += chunk
+                        if len(body) > MAX_SUB_SIZE:
+                            raise SubscriptionError("获取订阅失败：内容过大")
+                    return parse_content(body.decode("utf-8", errors="ignore"))
+            except httpx.HTTPError as e:
+                raise SubscriptionError(f"获取订阅失败：{type(e).__name__}") from e
+    raise SubscriptionError("获取订阅失败：重定向次数过多")
 
 
 def extract_sources(text: str) -> tuple[list[str], list[str]]:

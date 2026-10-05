@@ -42,6 +42,8 @@
 - 订阅链接（以 `clash.meta` UA 拉取，支持 Clash YAML 和 base64 分享链接列表）
 - 节点分享链接：`ss://` `ssr://` `vmess://` `vless://`（含 Reality）`trojan://` `hysteria://` `hysteria2://`/`hy2://` `tuic://` `socks5://` `anytls://`
 
+出于安全考虑，Bot 拉取订阅时会拒绝指向内网、本机或保留地址的链接（包括重定向后的地址），防止群成员借 Bot 探测部署机器所在的内网。
+
 结果优先使用 API 的图片导出；若套餐不支持图片导出，则回退为文本结果。
 
 ## 部署
