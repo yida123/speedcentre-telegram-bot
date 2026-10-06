@@ -1,8 +1,10 @@
 import os
-import re
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 import yaml
+
+from .schedule import ScheduleError, parse_schedule
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -59,17 +61,13 @@ def _str_list(value: str) -> list[str]:
     return [x for x in value.replace(" ", "").split(",") if x]
 
 
-def parse_times(value: str) -> list[tuple[int, int]]:
-    """解析 "09:00,21:30" 形式的每日时间点。"""
-    times = []
-    for item in value.replace(" ", "").split(","):
-        if not item:
-            continue
-        m = re.fullmatch(r"(\d{1,2}):(\d{2})", item)
-        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-            raise SystemExit(f"SCHEDULE_TIMES 中的时间「{item}」格式错误，应为 HH:MM，例如 09:00,21:00")
-        times.append((int(m.group(1)), int(m.group(2))))
-    return sorted(set(times))
+def _schedule_spec(value: str, tz: str) -> str:
+    """校验 SCHEDULE_TIMES（每日时间点或 cron），返回规范化写法；空值表示不自动测速。"""
+    try:
+        schedule = parse_schedule(value, ZoneInfo(tz))
+    except ScheduleError as e:
+        raise SystemExit(f"SCHEDULE_TIMES 无效：{e}") from e
+    return schedule.spec if schedule else ""
 
 
 @dataclass
@@ -79,13 +77,21 @@ class Config:
     api_base: str = "https://api.speedcentre.plus"
     subscriptions: list[tuple[str, str]] = field(default_factory=list)
     daily_limit: int = 0  # 群成员每人每天测速次数，0 表示不限
-    schedule_times: list[tuple[int, int]] = field(default_factory=list)
+    # 自动测速时间表：每日时间点（09:00,21:00）或 5 段 cron；空表示不自动测速
+    schedule_spec: str = ""
     auto_chat_ids: set[int] = field(default_factory=set)
     auto_slave_id: str = ""
     data_dir: str = "data"
     timezone: str = "Asia/Shanghai"
     allowed_chat_ids: set[int] = field(default_factory=set)
-    admin_user_ids: set[int] = field(default_factory=set)
+    admin_user_ids: set[int] = field(default_factory=set)  # .env 中的超级管理员，命令不能移除
+    extra_admin_ids: set[int] = field(default_factory=set)  # 超级管理员在私聊里添加的管理员
+    banned_user_ids: set[int] = field(default_factory=set)  # 被禁止测速的用户
+    cooldown_seconds: int = 0  # 群成员两次测速的最短间隔，0 表示不限
+    member_max_nodes: int = 0  # 群成员单次最多测多少个节点，0 表示使用 MAX_NODES
+    credit_alert: int = 0  # 当天积分消耗超过该值时私聊提醒管理员，0 表示不提醒
+    pin_auto_result: bool = True  # 置顶最新的本机场测速结果
+    anomaly_percent: int = 50  # 本机场测速中异常节点占比达到该百分比时提醒管理员，0 表示不提醒
     allow_private: bool = False
     max_nodes: int = 100
     max_tasks_per_chat: int = 1
@@ -144,7 +150,8 @@ class Config:
             subscriptions=load_subscriptions(os.environ.get("SUBSCRIPTIONS_FILE", "subscriptions.yaml")),
             daily_limit=int(os.environ.get("DAILY_LIMIT") or 0),
             # 未设置时默认每天 09:00；显式设为空则关闭自动测速
-            schedule_times=parse_times(os.environ.get("SCHEDULE_TIMES", "09:00")),
+            schedule_spec=_schedule_spec(os.environ.get("SCHEDULE_TIMES", "09:00"),
+                                         os.environ.get("TIMEZONE", "Asia/Shanghai")),
             auto_chat_ids=_int_set(os.environ.get("AUTO_CHAT_IDS", "")),
             auto_slave_id=os.environ.get("AUTO_SLAVE_ID", ""),
             data_dir=os.environ.get("DATA_DIR", "data"),
@@ -152,6 +159,11 @@ class Config:
             allowed_chat_ids=_int_set(os.environ.get("ALLOWED_CHAT_IDS", "")),
             admin_user_ids=_int_set(os.environ.get("ADMIN_USER_IDS", "")),
             allow_private=_bool(os.environ.get("ALLOW_PRIVATE", "false")),
+            cooldown_seconds=int(os.environ.get("COOLDOWN_SECONDS") or 0),
+            member_max_nodes=int(os.environ.get("MEMBER_MAX_NODES") or 0),
+            credit_alert=int(os.environ.get("CREDIT_ALERT") or 0),
+            pin_auto_result=_bool(os.environ.get("PIN_AUTO_RESULT") or "true"),
+            anomaly_percent=int(os.environ.get("ANOMALY_ALERT_PERCENT") or cls.anomaly_percent),
             max_nodes=int(os.environ.get("MAX_NODES", "100")),
             max_tasks_per_chat=int(os.environ.get("MAX_TASKS_PER_CHAT", "1")),
             default_slave_id=os.environ.get("DEFAULT_SLAVE_ID", ""),

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from telegram.ext import ApplicationHandlerStop
 
-from bot.config import Config, load_subscriptions, parse_times
+from bot.config import Config, load_subscriptions
 from bot.formatter import build_plan
 from bot.main import SpeedBot, TaskView
 from bot.quota import DailyQuota
@@ -32,9 +32,13 @@ class FakeUser:
         return f"<a>u{self.id}</a>"
 
 
+_ids = iter(range(1000, 10 ** 9))
+
+
 class FakeMessage:
     def __init__(self, chat_id=-100, text=""):
         self.chat_id, self.text, self.caption = chat_id, text, None
+        self.message_id = next(_ids)
         self.edits, self.replies, self.photos, self.photo_markups = [], [], [], []
         self.deleted = False
         self.reply_to_message = None
@@ -52,6 +56,7 @@ class FakeMessage:
         assert kw.get("allow_sending_without_reply") is True  # 被回复的消息可能已被定时删除
         self.photos.append(caption)
         self.photo_markups.append(kw.get("reply_markup"))
+        return FakeMessage(self.chat_id)
 
     async def delete(self):
         self.deleted = True
@@ -93,6 +98,9 @@ class FakeAPI:
         self.sort = sort
         return b"img"
 
+    async def cancel_task(self, task_id):
+        self.canceled = getattr(self, "canceled", []) + [task_id]
+
     async def create_share(self, task_id, title, hide_private_info=True):
         self.shared = (task_id, title, hide_private_info)
         return {"uuid": "5e1f0c2a-0000-4000-8000-00000000abcd"}
@@ -100,9 +108,23 @@ class FakeAPI:
 
 class FakeBot:
     username = "speedbot"
+    id = 777
 
     def __init__(self, members=(1, 2)):
         self.sent, self.members = [], set(members)
+        self.pins, self.unpins, self.commands = [], [], {}
+
+    async def pin_chat_message(self, chat_id, message_id, **kw):
+        self.pins.append((chat_id, message_id))
+
+    async def unpin_chat_message(self, chat_id, message_id=None, **kw):
+        self.unpins.append((chat_id, message_id))
+
+    async def set_my_commands(self, commands, scope=None, **kw):
+        self.commands[getattr(scope, "chat_id", None)] = [c.command for c in commands]
+
+    async def delete_my_commands(self, scope=None, **kw):
+        self.commands.pop(getattr(scope, "chat_id", None), None)
 
     async def send_message(self, chat_id, text, **kw):
         m = FakeMessage(chat_id)
@@ -366,7 +388,7 @@ def test_group_sub_link_deleted(tmp_path):
 # ---------------------------------------------------------------- 每日自动测速与手动触发
 
 def test_seconds_until_next_run(tmp_path):
-    bot = make_bot(tmp_path, schedule_times=[(9, 0), (21, 0)])
+    bot = make_bot(tmp_path, schedule_spec="09:00,21:00")
     tz = ZoneInfo("Asia/Shanghai")
     assert bot.seconds_until_next_run(datetime(2026, 10, 6, 8, 59, tzinfo=tz)) == 60
     assert bot.seconds_until_next_run(datetime(2026, 10, 6, 9, 0, tzinfo=tz)) == 12 * 3600
@@ -414,7 +436,7 @@ def test_autotest_command(tmp_path):
 
 def test_sub_command(tmp_path):
     async def run():
-        bot = make_bot(tmp_path, schedule_times=[(9, 0)])
+        bot = make_bot(tmp_path, schedule_spec="09:00")
         upd, msg = update("/sub")
         await bot.cmd_sub(upd, FakeContext())
         text = msg.replies[-1][0]
@@ -449,9 +471,6 @@ def test_load_subscriptions_and_times(tmp_path):
     with pytest.raises(SystemExit, match="重复"):
         load_subscriptions(str(p))
     assert load_subscriptions(str(tmp_path / "missing.yaml")) == []  # 没有本机场订阅时只提供群友测速
-    assert parse_times("21:00, 9:05,21:00") == [(9, 5), (21, 0)]
-    with pytest.raises(SystemExit, match="格式错误"):
-        parse_times("25:00")
 
 
 # ---------------------------------------------------------------- 审查发现的问题的回归测试
@@ -548,7 +567,7 @@ def test_scheduled_run_waits_for_manual_run(tmp_path):
 
 
 def test_schedule_across_dst_change(tmp_path):
-    bot = make_bot(tmp_path, schedule_times=[(9, 0)], timezone="America/New_York")
+    bot = make_bot(tmp_path, schedule_spec="09:00", timezone="America/New_York")
     tz = ZoneInfo("America/New_York")
     # 2026-11-01 凌晨 2 点夏令时结束：00:30 EDT 到 09:00 EST 实际经过 9.5 小时
     assert bot.seconds_until_next_run(datetime(2026, 11, 1, 0, 30, tzinfo=tz)) == 9.5 * 3600
@@ -560,9 +579,14 @@ def test_schedule_defaults_to_nine(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TG_BOT_TOKEN", "t")
     monkeypatch.setenv("SCP_API_KEY", "k")
-    assert Config.from_env().schedule_times == [(9, 0)]
+    assert Config.from_env().schedule_spec == "09:00"
     monkeypatch.setenv("SCHEDULE_TIMES", "")
-    assert Config.from_env().schedule_times == []
+    assert Config.from_env().schedule_spec == ""
+    monkeypatch.setenv("SCHEDULE_TIMES", "0 */6 * * *")
+    assert Config.from_env().schedule_spec == "0 */6 * * *"
+    monkeypatch.setenv("SCHEDULE_TIMES", "* * * * *")
+    with pytest.raises(SystemExit, match="至少间隔"):
+        Config.from_env()
 
 
 class YieldingQuery(FakeQuery):
@@ -796,7 +820,7 @@ def test_losing_final_click_keeps_its_menu(tmp_path):
 
 def test_schedule_in_repeated_fall_back_hour(tmp_path):
     from datetime import timezone as dt_tz
-    bot = make_bot(tmp_path, schedule_times=[(1, 30)], timezone="America/New_York")
+    bot = make_bot(tmp_path, schedule_spec="01:30", timezone="America/New_York")
     # 01:30 EDT 的那次已经跑过，现在是第二个 01:10（EST）：下一次应在明天 01:30，而不是负数立刻重跑
     now = datetime(2026, 11, 1, 6, 10, tzinfo=dt_tz.utc).astimezone(ZoneInfo("America/New_York"))
     assert bot.seconds_until_next_run(now) > 20 * 3600
