@@ -144,8 +144,10 @@ python -m bot.main
 - `SCP_TASK_URL`：网页查看任务的链接模板，如 `https://网页地址/tasks/{task_id}`，配置后进度消息显示「在 SpeedCentre+ 查看」
 - `SCP_SHARE_URL`：分享页链接模板，如 `https://网页地址/share/{uuid}`，配置后结果自动创建分享（隐藏节点地址等敏感信息）并显示「查看详情」
 - 测速配置：`SPEED_DOWNLOAD_URL`、`SPEED_DURATION`（默认 8 秒）、`SPEED_THREADS`（默认 4）、`PING_URL`、
-  `PING_AVERAGE_OVER`（默认 3）、`STUN_URL`、`TASK_RETRY`（默认 3）、`DNS_SERVERS`。每次提交测速都会带上完整配置——
-  API 文档把 `configs` 标为可选，但后端当前在省略它时会异常断连
+  `PING_AVERAGE_OVER`（默认 3）、`STUN_URL`、`TASK_RETRY`（默认 3）、`DNS_SERVERS`。默认值与
+  [SpeedCentre+ 官方对接示例](https://scx.gitbook.io/sc/scp-docs/speedcentre+-copilot-shi-yong)一致。每次提交测速都会带上完整配置——
+  API 文档把 `configs` 标为可选，但后端当前在省略它时会异常断连。`SPEED_DOWNLOAD_URL` 填 `INTL_ANTIHIJACK` 可启用
+  [内置反劫持测速](https://scx.gitbook.io/sc/scp-docs/liao-jie-geng-duo)，也支持自定义反劫持和 Telegram 下载测速
 - `DELETE_SUB_MESSAGE`：群里出现订阅/节点链接时自动删除（默认开启）
 - `SUB_LINK_PATTERN`：自定义“疑似订阅链接”的判断正则
 

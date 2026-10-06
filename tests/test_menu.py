@@ -954,3 +954,14 @@ def test_api_client_always_sends_configs():
         assert seen["configs"] == {"downloadDuration": 8}
 
     asyncio.run(run())
+
+
+def test_default_configs_match_official_example():
+    # https://scx.gitbook.io/sc/scp-docs/speedcentre+-copilot-shi-yong 中的 Koipy 对接示例
+    c = Config(bot_token="t", api_key="k").task_configs()
+    assert c["downloadDuration"] == 8 and c["downloadThreading"] == 4 and c["pingAverageOver"] == 3
+    assert c["taskRetry"] == 3 and c["dnsServers"] == [] and c["Scripts"] == []
+    assert c["downloadURL"] == ("https://dl.google.com/dl/android/studio/install/3.4.1.0/"
+                                "android-studio-ide-183.5522156-windows.exe")
+    assert c["pingAddress"] == "https://cp.cloudflare.com/generate_204"
+    assert c["stunURL"] == "udp://stunserver2025.stunprotocol.org:3478"

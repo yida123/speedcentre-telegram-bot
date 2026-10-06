@@ -87,13 +87,14 @@ class Config:
     sub_link_pattern: str = ""
     poll_interval: float = 5.0
     task_timeout: float = 1800.0
-    # 测速配置（提交任务时的 configs，同 miaospeed 的 SlaveRequestConfigs）
+    # 测速配置（提交任务时的 configs，同 miaospeed 的 SlaveRequestConfigs）。
+    # 默认值取自 SpeedCentre+ 官方文档「SpeedCentre+ Copilot - 使用」中的对接示例
     speed_download_url: str = "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe"
     speed_duration: int = 8
     speed_threads: int = 4
-    ping_url: str = "https://www.gstatic.com/generate_204"
+    ping_url: str = "https://cp.cloudflare.com/generate_204"
     ping_average_over: int = 3
-    stun_url: str = "udp://stun.msl.la:3478"
+    stun_url: str = "udp://stunserver2025.stunprotocol.org:3478"
     task_retry: int = 3
     dns_servers: list[str] = field(default_factory=list)
 
