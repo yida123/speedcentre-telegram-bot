@@ -1,4 +1,4 @@
-python-telegram-bot>=21,<23
+python-telegram-bot>=22.2,<23
 httpx>=0.27
 PyYAML>=6
 tzdata

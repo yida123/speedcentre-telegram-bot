@@ -45,6 +45,7 @@ class FakeMessage:
     async def reply_text(self, text, **kw):
         m = FakeMessage(self.chat_id)
         self.replies.append((text, kw.get("reply_markup"), m))
+        self.last_reply_kw = kw
         return m
 
     async def reply_photo(self, photo, caption=None, **kw):
@@ -1095,3 +1096,118 @@ def test_auto_delete_can_be_disabled(tmp_path, monkeypatch):
     for value, expected in (("", 10.0), ("0", 0.0), ("30", 30.0)):
         monkeypatch.setenv("AUTO_DELETE_SECONDS", value)
         assert Config.from_env().auto_delete_seconds == expected
+
+
+
+# ---------------------------------------------------------------- 自动删除专项审查的回归测试
+
+def test_abandoned_and_expired_menus_are_cleaned_up(tmp_path, monkeypatch):
+    import bot.main as main_mod
+    monkeypatch.setattr(main_mod, "SELECTION_TTL", 0.05)
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)  # 没人点的菜单，之后也没人再发 /speed
+        status = msg.replies[-1][2]
+        await asyncio.sleep(1.3)
+        assert status.deleted and not bot.selections
+
+        msg, ctx = await speed(bot)  # 过期后才被点击的菜单
+        status = msg.replies[-1][2]
+        sid = next(iter(bot.selections))
+        bot.selections[sid].created -= 10
+        q = await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        await asyncio.sleep(0.2)
+        assert "过期" in q.answers[0] and status.deleted
+
+    asyncio.run(run())
+
+
+def test_purge_skips_loading_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)
+        sid = next(iter(bot.selections))
+        sel = bot.selections[sid]
+        sel.page, sel.created = "loading", sel.created - 10_000
+        bot._purge_selections()
+        await asyncio.sleep(0.2)
+        assert sid in bot.selections and not sel.status.deleted
+
+    asyncio.run(run())
+
+
+def test_result_unavailable_notice_is_deleted(tmp_path):
+    from bot.api import APIError
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+
+        async def fail(*a, **kw):
+            raise APIError("任务不存在")
+
+        bot.api.get_result = bot.api.export_image = fail
+        upd, msg = update(f"/result {TASK_ID}")
+        await bot.cmd_result(upd, FakeContext([TASK_ID]))
+        notice = msg.replies[-1][2]
+        assert "无法获取结果" in msg.replies[-1][0]
+        await asyncio.sleep(0.05)
+        assert notice.deleted
+
+    asyncio.run(run())
+
+
+def test_progress_kept_when_result_could_not_be_posted(tmp_path):
+    from telegram.error import TimedOut
+
+    class FailingPhoto(FakeMessage):
+        async def reply_photo(self, *a, **kw):
+            raise TimedOut()
+
+    class Bot2(FakeBot):
+        async def send_message(self, chat_id, text, **kw):
+            m = FailingPhoto(chat_id)
+            self.sent.append((chat_id, text, kw.get("reply_markup"), m))
+            return m
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, subscriptions=SUBS[:1])
+        app = FakeApp()
+        app.bot = Bot2()
+        await bot.run_auto(app, [-100], "🕘")
+        await asyncio.sleep(0.05)
+        progress = app.bot.sent[0][3]
+        assert "已完成" in progress.edits[-1][0] and not progress.deleted  # 结果没发出去：保留摘要和任务 ID
+
+    asyncio.run(run())
+
+
+def test_timeout_notice_is_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, task_timeout=0, subscriptions=SUBS[:1])
+
+        async def running(task_id):
+            return {"status": "running", "completed_nodes": 0, "node_count": 1}
+
+        bot.api.get_task = running
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        await asyncio.sleep(0.05)
+        progress = app.bot.sent[0][3]
+        assert "等待超时" in progress.edits[-1][0] and not progress.deleted
+
+    asyncio.run(run())
+
+
+def test_pending_deletions_flushed_on_stop_and_replies_tolerate_deleted_command(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)  # 默认 10 秒
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        assert msg.last_reply_kw.get("allow_sending_without_reply") is True
+        reply = msg.replies[-1][2]
+        assert not msg.deleted and not reply.deleted
+        await bot.flush_expiring()  # 关闭时立即删除还没到时间的消息
+        assert msg.deleted and reply.deleted and not bot._timers
+
+    asyncio.run(run())

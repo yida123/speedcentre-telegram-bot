@@ -138,7 +138,7 @@ class SpeedBot:
         self._auto_lock = asyncio.Lock()
         self._loading: set[int] = set()  # 正在解析订阅的群成员，每人同时只能有一个
         self._parsing: dict[int, int] = {}  # 群成员仍在后台线程里跑的解析数（超时后线程不会停，跑完才算结束）
-        self._timers: set[asyncio.Task] = set()  # 待执行的定时删除
+        self._timers: dict[asyncio.Task, Message] = {}  # 待执行的定时删除 -> 要删除的消息
 
     # ------------------------------------------------------------ 群消息自动删除
 
@@ -149,11 +149,22 @@ class SpeedBot:
         if msg is None or delay <= 0 or msg.chat_id > 0:
             return
         task = asyncio.get_running_loop().create_task(self._delete_later(msg, delay))
-        self._timers.add(task)
-        task.add_done_callback(self._timers.discard)
+        self._timers[task] = msg
+        task.add_done_callback(lambda t: self._timers.pop(t, None))
+
+    async def flush_expiring(self) -> None:
+        """退出前把还没到时间的消息立即删掉，否则重启后它们会一直留在群里。"""
+        pending = list(self._timers.items())
+        self._timers.clear()
+        for task, _ in pending:
+            task.cancel()
+        await asyncio.gather(*(t for t, _ in pending), return_exceptions=True)
+        await asyncio.gather(*(self._delete_later(m, 0) for _, m in pending), return_exceptions=True)
 
     async def _say(self, msg: Message, text: str, **kw) -> Message:
         """回复一条临时消息（在群里会按 AUTO_DELETE_SECONDS 自动删除）。"""
+        # 用户的命令可能已被定时删除（例如 API 较慢超过了删除时间），此时照常发出，只是不再引用
+        kw.setdefault("allow_sending_without_reply", True)
         sent = await msg.reply_text(text, **kw)
         self.expire(sent)
         return sent
@@ -315,7 +326,8 @@ class SpeedBot:
             return False
 
     async def _delete_later(self, msg: Message, delay: float) -> None:
-        await asyncio.sleep(delay)
+        if delay > 0:
+            await asyncio.sleep(delay)
         try:
             await msg.delete()
         except TelegramError as e:  # 已被删除、超过 48 小时或没有删除权限
@@ -432,6 +444,7 @@ class SpeedBot:
             status = await msg.reply_text("📋 正在加载订阅…")
             sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave)
             self.selections[sid] = sel
+            self._schedule_purge(sel)
             await self._render_menu(sid, sel)
             return
         status = await msg.reply_text(f"📥 任务 <b>{esc(sub[0])}</b> 正在解析节点…", parse_mode=ParseMode.HTML)
@@ -635,6 +648,8 @@ class SpeedBot:
             self.selections.pop(sid, None)
             sel.page = "submitting"
             return True
+        if sid not in self.selections:
+            self._schedule_purge(sel)
         self.selections[sid] = sel
         return False
 
@@ -739,10 +754,17 @@ class SpeedBot:
 
     def _purge_selections(self) -> None:
         now = time.monotonic()
-        for sid in [k for k, s in self.selections.items() if now - s.created > SELECTION_TTL]:
+        # 正在加载的菜单还在使用中：等加载结束（提交 / 失败 / 回到菜单页）后再按过期处理
+        for sid in [k for k, s in self.selections.items()
+                    if now - s.created > SELECTION_TTL and s.page != "loading"]:
             sel = self.selections.pop(sid, None)
             if sel:
                 self.expire(sel.status, 0.1)  # 过期没人点的菜单直接清理
+
+    def _schedule_purge(self, sel: Selection) -> None:
+        """菜单到期后自动清理，不依赖之后有人再发 /speed。"""
+        delay = max(0.0, sel.created + SELECTION_TTL - time.monotonic()) + 1
+        asyncio.get_running_loop().call_later(delay, self._purge_selections)
 
     async def _all_backends(self) -> list[dict]:
         """后端列表，缓存 30 秒。"""
@@ -820,6 +842,9 @@ class SpeedBot:
         sel = self.selections.get(sid)
         if not sel or time.monotonic() - sel.created > SELECTION_TTL:
             self.selections.pop(sid, None)
+            # 过期菜单被点击时一并清理；sel 为 None（可能正被 _submit 用作进度消息）或仍在加载中时不删
+            if sel and sel.page != "loading":
+                self.expire(sel.status, 0.1)
             await q.answer("选择已过期，请重新发送 /speed。", show_alert=True)
             return
         if q.from_user.id != sel.owner.id and not self.is_admin(q.from_user.id):
@@ -1034,9 +1059,9 @@ class SpeedBot:
                     break
                 if time.monotonic() - started > self.cfg.task_timeout:
                     for m in statuses:
+                        # 不删除：结果没有发出来，这条消息是用 /result 取结果的唯一线索
                         await self._edit(m, self._task_text(
                             v, st, extra=f"⌛ 等待超时，可稍后使用 /result {v.task_id} 查看结果。"))
-                        self.expire(m)
                     return
 
                 done, total = task.get("completed_nodes", 0), task.get("node_count", 0)
@@ -1063,24 +1088,27 @@ class SpeedBot:
             summary = self._task_text(v, st, backend=task.get("slave_name"), extra=" · ".join(extra))
             for m in statuses:
                 await self._edit(m, summary)
+            done = statuses
             if st == "completed":
-                await self._send_result(statuses, v.task_id, v.sort, summary, await self._share_markup(v))
+                # 只删除结果已发出的进度消息；发送失败时保留摘要（含任务 ID，可用 /result 查看）
+                done = await self._send_result(statuses, v.task_id, v.sort, summary, await self._share_markup(v))
             # 结果图（含同样的摘要）已发出，进度消息完成使命；失败/取消的提示同样按时删除
-            for m in statuses:
+            for m in done:
                 self.expire(m)
         except Exception:
             log.exception("跟踪任务 %s 出错", v.task_id)
             for m in statuses:
+                # 同上，不删除
                 await self._edit(m, self._task_text(
                     v, "unknown", extra=f"⚠️ 跟踪任务时出错，可使用 /result {v.task_id} 查看结果。"))
-                self.expire(m)
         finally:
             for c in chat_ids:
                 self.running.get(c, set()).discard(v.task_id)
 
     async def _send_result(self, targets: Message | list[Message], task_id: str, sort: str | None, header: str,
-                           markup: InlineKeyboardMarkup | None = None) -> None:
-        """把结果图（导不出图时为文字结果）发到每个目标消息下面；结果和图片只获取一次。"""
+                           markup: InlineKeyboardMarkup | None = None) -> list[Message]:
+        """把结果图（导不出图时为文字结果）发到每个目标消息下面；结果和图片只获取一次。
+        返回确实收到了结果的目标消息。"""
         targets = targets if isinstance(targets, list) else [targets]
         entries: list[dict] = []
         try:
@@ -1096,15 +1124,22 @@ class SpeedBot:
         except APIError as e:
             log.info("导出任务 %s 结果图失败：%s", task_id, e)
             image = None
+        sent = []
         for reply_to in targets:
             try:
-                await self._send_result_to(reply_to, task_id, image, entries, caption, markup)
+                notice = await self._send_result_to(reply_to, task_id, image, entries, caption, markup)
+                if notice is None:
+                    sent.append(reply_to)
+                else:
+                    self.expire(notice)  # “无法获取结果。”只是提示，不是测速结果
             except TelegramError as e:
                 log.warning("向 %s 发送任务 %s 结果失败：%s", reply_to.chat_id, task_id, e)
+        return sent
 
     @staticmethod
     async def _send_result_to(reply_to: Message, task_id: str, image: bytes | None, entries: list[dict],
-                              caption: str, markup: InlineKeyboardMarkup | None) -> None:
+                              caption: str, markup: InlineKeyboardMarkup | None) -> Message | None:
+        """发出结果；拿不到任何结果时只发一条提示并返回它（由调用方按时删除）。"""
         # 被回复的消息（命令或进度消息）可能已被定时删除，此时照常发出结果，只是不再引用
         kw = {"allow_sending_without_reply": True}
         if image:
@@ -1118,8 +1153,8 @@ class SpeedBot:
                                               parse_mode=ParseMode.HTML, reply_markup=markup, **kw)
             return
         if not entries:
-            await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML, reply_markup=markup, **kw)
-            return
+            return await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML,
+                                             reply_markup=markup, **kw)
         # 按行切分，避免截断 HTML 标签
         chunks = _split(f"{caption}\n\n{format_result_text(entries)}", 4000)
         for i, chunk in enumerate(chunks):
@@ -1154,6 +1189,9 @@ def main() -> None:
         # post_init 时 Application 还没进入运行状态，用 asyncio 直接创建定时任务，关闭时再取消
         scheduler_task[0] = asyncio.create_task(bot.scheduler(app), name="daily-speedtest")
 
+    async def _post_stop(app: Application) -> None:
+        await bot.flush_expiring()
+
     async def _post_shutdown(app: Application) -> None:
         if scheduler_task[0]:
             scheduler_task[0].cancel()
@@ -1161,7 +1199,7 @@ def main() -> None:
 
     # 并发处理更新：一个用户的订阅拉取或 API 调用较慢时，不影响其他人（包括删除群里的订阅链接）
     app = (Application.builder().token(cfg.bot_token).concurrent_updates(True)
-           .post_init(_post_init).post_shutdown(_post_shutdown).build())
+           .post_init(_post_init).post_stop(_post_stop).post_shutdown(_post_shutdown).build())
     # 先于其他处理器检查群消息中的订阅链接
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
                                    bot.on_group_message), group=-1)
