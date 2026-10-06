@@ -52,6 +52,7 @@ ADMIN_COMMANDS = [
 ]
 MAX_SUB_NAME = 32
 MAX_LISTED_TASKS = 20
+MAX_LISTED_USERS = 100
 
 SCHEDULE_HELP = """<b>用法</b>
 <code>/schedule 09:00,21:00</code> 每天固定时间
@@ -84,6 +85,13 @@ def parse_number(text: str) -> int:
     if not text.isdigit():
         raise ValueError(text)
     return int(text)
+
+
+def _host(url: str) -> str | None:
+    try:
+        return urlsplit(url).hostname
+    except ValueError:  # 例如 https://[abc/sub
+        return None
 
 
 def _user_id(text: str) -> int | None:
@@ -147,7 +155,13 @@ class AdminCommands:
         if args:
             return _user_id(args[0])
         reply = msg.reply_to_message
-        if reply and reply.from_user and not reply.from_user.is_bot:
+        if reply is None:
+            return None
+        # 论坛话题里每条消息都隐式“回复”话题的创建消息，那不是管理员要操作的人；频道评论区同理（自动转发的频道帖子）
+        if (getattr(reply, "forum_topic_created", None) is not None or getattr(reply, "is_automatic_forward", False)
+                or (getattr(msg, "is_topic_message", False) and reply.message_id == msg.message_thread_id)):
+            return None
+        if reply.from_user and not reply.from_user.is_bot:
             return reply.from_user.id
         return None
 
@@ -157,20 +171,42 @@ class AdminCommands:
         return "\n".join(lines)
 
     async def set_commands(self, bot) -> None:
-        """设置命令菜单：所有人看到普通命令，管理员私聊里额外看到管理命令。"""
+        """设置命令菜单：所有人看到普通命令，管理员私聊里额外看到管理命令；已不是管理员的人去掉管理命令。"""
         await bot.set_my_commands([BotCommand(n, d) for n, d in USER_COMMANDS])
-        for uid in sorted(self.admin_ids()):
-            await self._set_admin_menu(bot, uid, True)
+        for uid in sorted(self.admin_ids() | self._menu_users()):
+            await self._set_admin_menu(bot, uid, self.is_admin(uid))
 
-    async def _set_admin_menu(self, bot, user_id: int, admin: bool) -> None:
+    def _menu_users(self) -> set[int]:
+        """设置过管理命令菜单的用户（保存在 settings.json，重启后用来清理已不是管理员的人的菜单）。"""
+        return {int(x) for x in self.settings.data.get("admin_menus") or []}
+
+    async def _set_admin_menu(self, bot, user_id: int, admin: bool) -> bool:
         scope = BotCommandScopeChat(user_id)
         try:
             if admin:
                 await bot.set_my_commands([BotCommand(n, d) for n, d in USER_COMMANDS + ADMIN_COMMANDS], scope=scope)
             else:
                 await bot.delete_my_commands(scope=scope)
-        except TelegramError as e:  # 对方还没私聊过 bot
+        except TelegramError as e:  # 对方还没私聊过 bot：等他私聊时（/start、/help）再设置
             log.info("设置用户 %s 的命令菜单失败：%s", user_id, e)
+            return False
+        users = self._menu_users()
+        users = users | {user_id} if admin else users - {user_id}
+        if users != self._menu_users():
+            try:
+                self.settings.set("admin_menus", users)
+            except OSError as e:
+                log.warning("保存命令菜单记录失败：%s", e)
+        if admin:
+            self._menu_ready.add(user_id)
+        else:
+            self._menu_ready.discard(user_id)
+        return True
+
+    async def ensure_admin_menu(self, bot, user_id: int) -> None:
+        """管理员私聊 bot 时补设命令菜单（启动时他可能还没私聊过 bot，当时设置会失败）。"""
+        if self.is_admin(user_id) and user_id not in self._menu_ready:
+            await self._set_admin_menu(bot, user_id, True)
 
     def _schedule_summary(self) -> str:
         if not self.schedule:
@@ -304,7 +340,10 @@ class AdminCommands:
         if uid is None:
             usage = (f"<code>/{'ban' if ban else 'unban'} 用户ID</code>，或在群里回复某人的消息发送 "
                      f"<code>/{'ban' if ban else 'unban'}</code>")
-            lines = [f"<b>禁止测速的用户</b>（{len(banned)} 人）"] + [f"• <code>{u}</code>" for u in sorted(banned)]
+            lines = [f"<b>禁止测速的用户</b>（{len(banned)} 人）"]
+            lines += [f"• <code>{u}</code>" for u in sorted(banned)[:MAX_LISTED_USERS]]
+            if len(banned) > MAX_LISTED_USERS:
+                lines.append(f"… 还有 {len(banned) - MAX_LISTED_USERS} 人")
             await self._reply(update, "\n".join(lines + ["", usage]))
             return
         if ban:
@@ -354,10 +393,13 @@ class AdminCommands:
             if not found_subs and not uris:
                 await self._reply(update, "没有找到订阅链接或节点链接。\n" + usage)
                 return
+            if any(_host(u) is None for u in found_subs):
+                await self._reply(update, "订阅链接格式不正确。\n" + usage)
+                return
             subs.append((name, " ".join(found_subs + uris)))
             done = f"✅ 已添加本机场订阅「{esc(name)}」，可以发送 /autotest 立即测速检查。"
         elif action == "del":
-            sub = self._match_sub(args[1]) if len(args) > 1 else None
+            sub = self._match_sub(" ".join(args[1:])) if len(args) > 1 else None  # subscriptions.yaml 里的名称可以有空格
             if not sub:
                 await self._reply(update, f"没有找到这个订阅。\n{usage}")
                 return
@@ -366,7 +408,7 @@ class AdminCommands:
         else:
             lines = [f"<b>本机场订阅</b>（{len(subs)} 个）"]
             for name, url in subs:
-                host = urlsplit(url.split()[0]).hostname if private else None  # 群里只显示名称
+                host = _host(url.split()[0]) if private and url.split() else None  # 群里只显示名称
                 lines.append(f"• <code>{esc(name)}</code>" + (f" · {esc(host)}" if host else ""))
             await self._reply(update, "\n".join(lines + ["", usage]))
             return
@@ -501,10 +543,11 @@ class AdminCommands:
         if not await self._admin_guard(update):
             return
         auto = self._auto_lock.locked()
-        if auto:
-            self._auto_stop = True
+        # 正在提交的任务和排队中的本机场测速看到计数变了会自行取消/停止
+        self._stop_gen += 1
+        submitting = len({t for tasks in self.running.values() for t in tasks if t.startswith("pending-")})
         ids = list(self.active)
-        if not ids and not auto:
+        if not ids and not auto and not submitting:
             await self._reply(update, "当前没有进行中的任务。")
             return
         results = await asyncio.gather(*(self.api.cancel_task(t) for t in ids), return_exceptions=True)
@@ -512,6 +555,8 @@ class AdminCommands:
         lines = [f"已对 {len(ids) - len(errors)} 个任务发起取消。"]
         if errors:
             lines.append(f"{len(errors)} 个取消失败：{esc(errors[0])}")
+        if submitting:
+            lines.append(f"还有 {submitting} 个正在提交，提交后会立即取消。")
         if auto:
             lines.append("本轮本机场测速剩下的订阅不再继续。")
         log.info("管理员 %s 终止了所有任务（%d 个）", update.effective_user.id, len(ids))

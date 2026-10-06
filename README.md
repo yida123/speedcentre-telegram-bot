@@ -46,7 +46,7 @@ Bot 会校验私聊用户是该群成员。默认不限测速次数；设置了 
 
 ### 管理员命令
 
-建议在私聊里使用（在群里使用时，命令和回复同样会在 10 秒后删除）。管理员私聊 bot 时，命令菜单里会多出这些命令，
+建议在私聊里使用（在群里使用时，命令和回复同样会在 10 秒后删除）。管理员私聊 bot 发一次 `/start` 后，私聊的命令菜单里会多出这些命令，
 `/help` 也会列出。修改**立即生效**，保存在 `DATA_DIR/settings.json`（systemd 部署为 `/var/lib/speed-bot/settings.json`），
 重启不丢，并**优先于 `.env` 和 `subscriptions.yaml` 中的同名配置**。
 
@@ -71,7 +71,8 @@ Bot 会校验私聊用户是该群成员。默认不限测速次数；设置了 
 自动测速时间支持三种写法（按 `TIMEZONE` 计算，两次至少间隔 10 分钟）：
 
 - 每天固定时间：`09:00,21:00`
-- 固定间隔：`6h`（0、6、12、18 点整）、`30m`（每小时 0 分和 30 分）
+- 固定间隔：`6h`（0、6、12、18 点整）、`30m`（每小时 0 分和 30 分）。间隔需要能整除 1 小时或 24 小时
+  （`10m` `15m` `20m` `30m`、`1h` `2h` `3h` `4h` `6h` `8h` `12h` `24h`），其他间隔请用 cron 或每日时间点
 - 标准 5 段 cron「分 时 日 月 周」：`0 */4 * * *`、`0 8-22/2 * * *`、`30 9 * * 1-5`（工作日 09:30）、`0 9 * * mon`，
   支持 `*` `,` `-` `/`、月份和星期的英文缩写，以及 `@daily`、`@hourly` 等
 
@@ -148,7 +149,9 @@ sudo bash /opt/speed_bot/deploy/install.sh --update   # 拉取最新代码并重
 ```
 
 服务挂掉会在 5 秒后自动重启，服务器重启后自动运行。每日次数记录（`usage.json`）、当天统计（`stats.json`）和管理员用命令改的
-设置（`settings.json`）保存在 `/var/lib/speed-bot/`，重启不丢。想让某项设置重新以 `.env` 为准，删掉 `settings.json` 里对应的那一项后重启。
+设置（`settings.json`）保存在 `/var/lib/speed-bot/`，重启不丢。想让某项设置重新以 `.env` 为准：先 `sudo systemctl stop speed-bot`，
+把 `settings.json` 里那一项的值改成 `null`（或删掉这一项，注意保持合法的 JSON，例如去掉多余的逗号），再启动。
+`settings.json` 无法读取或不是合法 JSON 时，bot 会拒绝启动并在日志里说明，避免带着空设置运行（授权群变成“不限”）或把文件覆盖掉。
 
 ### 或者用 Docker
 
@@ -183,7 +186,7 @@ python -m bot.main
 - `CREDIT_ALERT`：当天积分消耗超过该值时私聊提醒管理员，默认 `0` 不提醒（`/creditalert`）
 - `ANOMALY_ALERT_PERCENT`：本机场自动测速失败或没有速度的节点占比达到该值时提醒管理员，默认 `50`，`0` 不提醒（`/alert`）
 - `PIN_AUTO_RESULT`：置顶最新一轮本机场测速结果，默认 `true`（`/pin`）
-- `AUTO_CHAT_IDS`：自动测速结果发到哪些群，留空为所有 `ALLOWED_CHAT_IDS`
+- `AUTO_CHAT_IDS`：自动测速结果发到哪些群，留空为所有 `ALLOWED_CHAT_IDS`；设置了授权群时，只会发到其中仍是授权群的群（被 `/group del` 移除的群不再收到）
 - `AUTO_SLAVE_ID`：自动测速使用的后端，留空用 `DEFAULT_SLAVE_ID` 或自动选择
 - `DAILY_LIMIT`：群成员每人每天测速次数，默认 `0` 不限（管理员和自动测速不计，可用 `/limit` 修改）
 - `TIMEZONE`：按哪个时区计算“每天”，默认 `Asia/Shanghai`

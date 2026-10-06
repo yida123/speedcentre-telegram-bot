@@ -92,6 +92,7 @@ class Selection:
     backend_page: int = 0
     sort: str | None = None  # None 表示未选择（使用平均速度降序）
     warnings: str = ""  # 部分订阅失败或被跳过时的提示
+    airport: bool = False  # 管理员测速本机场订阅（只有管理员可以提交）
     page: str = "subs"
     created: float = field(default_factory=time.monotonic)
 
@@ -168,7 +169,9 @@ class SpeedBot(AdminCommands):
         self.started = time.monotonic()
         self.active: dict[str, ActiveTask] = {}  # 进行中的任务
         self.last_test: dict[int, float] = {}  # 群成员上次提交测速的时间（冷却）
-        self._auto_stop = False  # /stopall：本轮自动测速剩下的订阅不再继续
+        # /stopall 的次数：开始时记下它，之后变了就说明期间有人终止了所有任务（本轮自动测速、正在提交的任务）
+        self._stop_gen = 0
+        self._menu_ready: set[int] = set()  # 已设置好管理命令菜单的管理员
         self.running: dict[int, set[str]] = {}  # chat_id -> task_ids
         self.owners: dict[str, int] = {}  # task_id -> user_id
         self.selections: dict[str, Selection] = {}  # 菜单 id -> 选择状态
@@ -290,6 +293,7 @@ class SpeedBot(AdminCommands):
         text = HELP_TEXT.format(quota=quota, schedule=self._schedule_text())
         if update.effective_chat.type == ChatType.PRIVATE and self.is_admin(update.effective_user.id):
             text += "\n\n" + self.admin_help()
+            await self.ensure_admin_menu(context.bot, update.effective_user.id)
         await self._say(update.effective_message, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -524,13 +528,15 @@ class SpeedBot(AdminCommands):
         sid = secrets.token_hex(4)
         if sub is None:
             status = await msg.reply_text("📋 正在加载订阅…")
-            sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave)
+            sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave,
+                            airport=True)
             self.selections[sid] = sel
             self._schedule_purge(sel)
             await self._render_menu(sid, sel)
             return
         status = await msg.reply_text(f"📥 任务 <b>{esc(sub[0])}</b> 正在解析节点…", parse_mode=ParseMode.HTML)
-        sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave, sub=sub)
+        sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave, sub=sub,
+                        airport=True)
         if await self._prepare(sel):
             await self._next_step(sid, sel, context.application)
 
@@ -544,8 +550,9 @@ class SpeedBot(AdminCommands):
         msg, user = update.effective_message, update.effective_user
         m = re.fullmatch(r"g(-?\d+)(?:_\w+)?", (context.args or [""])[0])
         if update.effective_chat.type != ChatType.PRIVATE or not m:
-            await self.cmd_help(update, context)
+            await self.cmd_help(update, context)  # 管理员的命令菜单在这里补设
             return
+        await self.ensure_admin_menu(context.bot, user.id)
         chat_id = int(m.group(1))
         if not self.group_allowed(chat_id):
             await self._say(msg, "该群未授权使用此 Bot。")
@@ -768,7 +775,8 @@ class SpeedBot(AdminCommands):
         return (nxt.astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()
 
     def _auto_chats(self) -> list[int]:
-        return sorted(self.cfg.auto_chat_ids or self.cfg.allowed_chat_ids)
+        """自动测速发往的群：AUTO_CHAT_IDS（留空为所有授权群），已被移出授权群的不再发送。"""
+        return sorted(c for c in (self.cfg.auto_chat_ids or self.cfg.allowed_chat_ids) if self.group_allowed(c))
 
     async def scheduler(self, application: Application) -> None:
         """按时间表自动测速本机场订阅并发到群里。管理员修改时间表、订阅或授权群后立即按新设置重新计时。"""
@@ -798,11 +806,11 @@ class SpeedBot(AdminCommands):
         已有自动测速在进行且 wait_for_lock=False 时返回 False。"""
         if self._auto_lock.locked() and not wait_for_lock:
             return False
+        gen = self._stop_gen  # 排队等锁期间的 /stopall 同样作数
         async with self._auto_lock:
-            self._auto_stop = False
             posted: dict[int, list[Message]] = {}
             for sub in list(self.cfg.subscriptions):
-                if self._auto_stop:
+                if self._stop_gen != gen:
                     break
                 statuses = []
                 for chat_id in chat_ids:
@@ -816,13 +824,14 @@ class SpeedBot(AdminCommands):
                 sel = Selection(owner=None, chat_id=statuses[0].chat_id, status=statuses[0], sub=sub,
                                 slave_arg=None, sort="avg_speed_desc")
                 error = await self._load_nodes(sel)
-                if not error and self._auto_stop:
+                stopped = self._stop_gen != gen
+                if not error and stopped:
                     error = f"🚫 任务 <b>{esc(sub[0])}</b> 已被管理员终止。"
                 if error:
                     for m in statuses:
                         await self._edit(m, error)
                         self.expire(m)
-                    if not self._auto_stop and self.cfg.anomaly_percent > 0:
+                    if not stopped and self.cfg.anomaly_percent > 0:
                         await self._notify_admins(
                             application.bot, f"⚠️ 本机场订阅「{esc(sub[0])}」自动测速没能开始：\n{error}")
                     continue
@@ -996,6 +1005,9 @@ class SpeedBot(AdminCommands):
         if q.from_user.id != sel.owner.id and not self.is_admin(q.from_user.id):
             await q.answer("只有发起人可以操作。")
             return
+        if sel.airport and not self.is_admin(sel.owner.id):
+            await q.answer("发起人已不是管理员，不能测速本机场订阅。", show_alert=True)
+            return
 
         kind, _, arg = action.partition(":")
         idx = int(arg) if arg.isdigit() else -1
@@ -1028,9 +1040,12 @@ class SpeedBot(AdminCommands):
         if not valid:
             await q.answer()
             return
-        # 先检查再修改，忙碌时菜单保持原样，稍后可以再点
+        # 先检查再修改，忙碌或冷却中时菜单保持原样，稍后可以再点
         if self._busy(sel.chat_id):
             await q.answer("群里已有测速任务在运行，请等待完成后再试。", show_alert=True)
+            return
+        if self._cooldown_left(sel.owner.id):
+            await q.answer(self._cooldown_text(sel.owner.id), show_alert=True)
             return
         if kind == "b":
             if arg == "auto":
@@ -1067,6 +1082,8 @@ class SpeedBot(AdminCommands):
             problem = None
             if user is not None and self.is_banned(user.id):
                 problem = "你已被管理员禁止使用测速。"
+            elif sel.airport and user is not None and not self.is_admin(user.id):
+                problem = "你已不是管理员，不能测速本机场订阅。"
             elif not self.group_allowed(sel.chat_id):
                 problem = "该群已不在授权名单中，无法测速。"
             elif member and self._remaining(user.id) == 0:
@@ -1080,6 +1097,7 @@ class SpeedBot(AdminCommands):
                 self.expire(status)
                 return []
         # 检查之后立即（不经过 await）预占次数、冷却和群的任务名额，避免并发提交绕过限制；提交失败再退回
+        stop_gen = self._stop_gen
         remaining = self.quota.consume(user.id) if member else None
         quota_day = self.quota.date  # 退回时只退同一天的扣减
         last_test = self.last_test.get(user.id) if member else None
@@ -1134,6 +1152,11 @@ class SpeedBot(AdminCommands):
             self.owners[task_id] = user.id
         who = requester or "发起人 " + user.mention_html()
         self.active[task_id] = ActiveTask(task_id, sel.label, who, user.id if user else None, chats)
+        if self._stop_gen != stop_gen:  # 提交过程中管理员发送了 /stopall：任务一创建就取消
+            try:
+                await self.api.cancel_task(task_id)
+            except APIError as e:
+                log.warning("取消任务 %s 失败：%s", task_id, e)
         info = f"{who} · 节点 {len(sel.nodes)} 个"
         if sel.name_filter:
             info += f" · 过滤 <code>{esc(sel.name_filter)}</code>"

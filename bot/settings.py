@@ -21,15 +21,21 @@ def _write_json(path: str, data: dict) -> None:
     os.replace(tmp, path)
 
 
-def _read_json(path: str) -> dict:
+def _read_json(path: str, strict: bool = False) -> dict:
+    """读取 JSON 对象；文件不存在时返回 {}。读取或解析失败时，strict=True 直接退出，否则记录警告并返回 {}。"""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            raise ValueError("顶层不是 JSON 对象")
+        return data
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:
-        log.warning("读取 %s 失败，忽略其中的设置：%s", path, e)
+        if strict:
+            # 不能带着空设置继续运行：授权群会变成“不限”，下一次保存还会把整个文件覆盖掉
+            raise SystemExit(f"无法读取设置文件 {path}：{e}。请修复（保证是合法的 JSON）或删除这个文件后重启") from e
+        log.warning("读取 %s 失败，忽略其中的数据：%s", path, e)
         return {}
 
 
@@ -53,7 +59,7 @@ class SettingsStore:
 
     def __init__(self, path: str):
         self.path = path
-        self.data = _read_json(path)
+        self.data = _read_json(path, strict=True)
 
     def apply_to(self, cfg) -> None:
         """把已保存的设置套到 Config 上（启动时调用一次）。"""

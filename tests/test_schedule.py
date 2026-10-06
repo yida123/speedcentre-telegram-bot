@@ -82,3 +82,45 @@ def test_interval_shorthand_and_separators():
             parse_schedule(bad)
     with pytest.raises(ScheduleError, match="至少间隔"):
         parse_schedule("5m")
+
+
+@pytest.mark.parametrize("spec", ["23h", "7h", "5h", "50m", "45m", "25m", "11m"])
+def test_uneven_intervals_are_rejected(spec):
+    # */N 每小时/每天从头算，N 不能整除时间隔忽长忽短（例如 23h 实际是 23:00 和 00:00 各一次）
+    with pytest.raises(ScheduleError, match="整除"):
+        parse_schedule(spec)
+
+
+def test_min_gap_is_exact_not_sampled():
+    # 22:55 → 23:00 只差 5 分钟（抽样前 60 次运行时发现不了）
+    with pytest.raises(ScheduleError, match="至少间隔"):
+        parse_schedule("0,10,20,30,40,55 0-20/2,22,23 * * *")
+    times = ",".join(f"{m // 60:02d}:{m % 60:02d}" for m in range(0, 720, 10)) + ",11:55"
+    with pytest.raises(ScheduleError, match="至少间隔"):
+        parse_schedule(times)
+    # 前一天 23:55 到第二天 00:00 只差 5 分钟
+    with pytest.raises(ScheduleError, match="至少间隔"):
+        parse_schedule("0,55 0,23 * * *")
+    # 只在周一运行时，周一 23:55 到下周一 00:00 隔了一周，可以
+    assert parse_schedule("0,55 0,23 * * 1").spec == "0,55 0,23 * * 1"
+
+
+def test_min_gap_across_spring_forward():
+    # 2026-03-08 纽约 02:50 不存在，实际 03:50 运行，和 03:55 只差 5 分钟
+    with pytest.raises(ScheduleError, match="至少间隔"):
+        parse_schedule("02:50,03:55", NY)
+    assert parse_schedule("02:50,03:55", SH).spec == "02:50,03:55"
+
+
+@pytest.mark.parametrize("spec", ["² 9 * * *", "0 9 * * */²", "0 ²-3 * * *"])
+def test_non_ascii_digits_raise_schedule_error(spec):
+    with pytest.raises(ScheduleError):
+        parse_schedule(spec)
+
+
+def test_parse_is_fast():
+    import time
+    start = time.monotonic()
+    for spec in ("0 0 29 2 *", "0 9 31 * *", "*/10 * * * *", "0 9 * * 1-5", "@yearly"):
+        parse_schedule(spec, NY)
+    assert time.monotonic() - start < 2

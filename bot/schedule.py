@@ -38,11 +38,16 @@ class ScheduleError(ValueError):
     pass
 
 
+def _is_number(text: str) -> bool:
+    # 只认 ASCII 数字：“²”这类字符 isdigit() 为真，但 int() 会报错
+    return text.isascii() and text.isdigit()
+
+
 def _parse_value(text: str, names: dict, label: str) -> int:
     text = text.lower()
     if text in names:
         return names[text]
-    if not text.isdigit():
+    if not _is_number(text):
         raise ScheduleError(f"{label}字段中的「{text}」不是数字")
     return int(text)
 
@@ -56,7 +61,7 @@ def _parse_field(text: str, lo: int, hi: int, names: dict, label: str) -> tuple[
         rng, _, step_text = part.partition("/")
         step = 1
         if step_text:
-            if not step_text.isdigit() or int(step_text) == 0:
+            if not _is_number(step_text) or int(step_text) == 0:
                 raise ScheduleError(f"{label}字段的步长「{step_text}」无效")
             step = int(step_text)
         if rng == "*":
@@ -138,37 +143,66 @@ class Schedule:
             day += timedelta(days=1)
         return None
 
-    def min_gap_minutes(self, tz: ZoneInfo, samples: int = 60) -> float | None:
-        """抽样计算相邻两次运行的最短间隔（分钟）。"""
-        start = datetime(2026, 1, 1, tzinfo=tz)
-        prev, gap = self.next_after(start, tz), None
-        for _ in range(samples):
-            if prev is None:
-                break
-            nxt = self.next_after(prev, tz)
-            if nxt is None:
-                break
-            diff = (nxt.astimezone(timezone.utc) - prev.astimezone(timezone.utc)).total_seconds() / 60
-            gap = diff if gap is None else min(gap, diff)
-            prev = nxt
-        return gap
+    def _day_minutes(self) -> list[int]:
+        """每个运行日内的运行时刻（从 0 点起的分钟数），升序。"""
+        if self.times:
+            return sorted(h * 60 + m for h, m in self.times)
+        return sorted(h * 60 + m for h in self.hours for m in self.minutes)
+
+    def _runs_on_consecutive_days(self) -> bool:
+        """是否存在连续两天都运行（这时要算上从前一天最后一次到第二天第一次的间隔）。"""
+        if self.times:
+            return True
+        day, prev = date(2024, 1, 1), False
+        for _ in range(366 * 4 + 1):  # 4 年覆盖所有月份长度和闰年
+            cur = self._day_matches(day)
+            if cur and prev:
+                return True
+            day, prev = day + timedelta(days=1), cur
+        return False
+
+    def _dst_gaps(self, tz: ZoneInfo) -> list[float]:
+        """夏令时切换前后实际（UTC）的运行间隔：例如切换日不存在的 02:50 实际在 03:50 运行。"""
+        gaps: list[float] = []
+        day = date(2026, 1, 1)
+        for _ in range(366 * 2):
+            nxt = day + timedelta(days=1)
+            if datetime(day.year, day.month, day.day, tzinfo=tz).utcoffset() != \
+                    datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz).utcoffset():
+                start = day - timedelta(days=1)
+                end = (datetime(nxt.year, nxt.month, nxt.day, tzinfo=tz) + timedelta(days=2)).astimezone(timezone.utc)
+                prev = None
+                t = self.next_after(datetime(start.year, start.month, start.day, tzinfo=tz), tz)
+                while t is not None and t.astimezone(timezone.utc) < end:
+                    if prev is not None:
+                        gaps.append((t.astimezone(timezone.utc) - prev.astimezone(timezone.utc)).total_seconds() / 60)
+                    prev, t = t, self.next_after(t, tz)
+            day = nxt
+        return gaps
+
+    def min_gap_minutes(self, tz: ZoneInfo) -> float | None:
+        """相邻两次运行的最短间隔（分钟）：同一天内、跨到第二天，以及夏令时切换前后。只运行一次时返回 None。"""
+        minutes = self._day_minutes()
+        gaps = [float(b - a) for a, b in zip(minutes, minutes[1:])]
+        if minutes and self._runs_on_consecutive_days():
+            gaps.append(float(minutes[0] + 1440 - minutes[-1]))
+        if gaps and min(gaps) < MIN_INTERVAL_MINUTES:
+            return min(gaps)  # 已经太密，不必再检查夏令时
+        gaps += self._dst_gaps(tz)
+        return min(gaps) if gaps else None
 
 
 def _interval_to_cron(count: int, unit: str) -> str:
     """把“每 N 小时/分钟”换成 cron（从 0 点/整点起算）。"""
     minutes = count * 60 if unit in ("h", "小时", "hour", "hours") else count
-    if minutes <= 0:
-        raise ScheduleError("间隔必须大于 0")
-    if minutes % 60 == 0:
-        hours = minutes // 60
-        if hours == 24:
-            return "0 0 * * *"
-        if hours < 24:
-            return f"0 */{hours} * * *"
-        raise ScheduleError("间隔最长 24 小时，更长的周期请用 cron，例如每周一 09:00：0 9 * * 1")
-    if minutes < 60:
+    # cron 的 */N 每小时（或每天）从头算起，N 不能整除 60（或 24）时间隔会忽长忽短，所以只接受能整除的
+    if 0 < minutes < 60 and 60 % minutes == 0:
         return f"*/{minutes} * * * *"
-    raise ScheduleError("间隔超过 1 小时时需要是整小时，例如 2h；其他情况请用 cron")
+    if minutes % 60 == 0 and 0 < minutes // 60 <= 24 and 24 % (minutes // 60) == 0:
+        hours = minutes // 60
+        return "0 0 * * *" if hours == 24 else f"0 */{hours} * * *"
+    raise ScheduleError("间隔需要能整除 1 小时或 24 小时，例如 10m、15m、20m、30m、1h、2h、3h、4h、6h、8h、12h、24h；"
+                        "其他间隔请用 cron 或每日时间点")
 
 
 def parse_schedule(text: str | None, tz: ZoneInfo | None = None) -> Schedule | None:
@@ -179,10 +213,10 @@ def parse_schedule(text: str | None, tz: ZoneInfo | None = None) -> Schedule | N
     lowered = text.lower()
     if lowered in _ALIASES:
         text = _ALIASES[lowered]
-    m = re.fullmatch(r"(?:每|every)?\s*(\d{1,4})\s*(h|hours?|小时|m|min|mins|minutes?|分钟)", lowered)
+    m = re.fullmatch(r"(?:每|every)?\s*([0-9]{1,4})\s*(h|hours?|小时|m|min|mins|minutes?|分钟)", lowered)
     if m:
         text = _interval_to_cron(int(m.group(1)), m.group(2))
-    if re.fullmatch(r"\d{1,2}:\d{2}([\s,，、]+\d{1,2}:\d{2})*", text):
+    if re.fullmatch(r"[0-9]{1,2}:[0-9]{2}([\s,，、]+[0-9]{1,2}:[0-9]{2})*", text):
         times = set()
         for item in re.split(r"[\s,，、]+", text):
             h, m = (int(x) for x in item.split(":"))

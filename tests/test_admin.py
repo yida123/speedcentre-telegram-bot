@@ -499,7 +499,7 @@ def test_stopall_stops_remaining_auto_subscriptions(tmp_path):
         original = bot.api.get_task
 
         async def get_task(task_id):
-            if not bot._auto_stop:  # 第一个订阅测速期间管理员发送 /stopall
+            if bot._stop_gen == 0:  # 第一个订阅测速期间管理员发送 /stopall
                 await command(bot, "stopall", "/stopall")
             return await original(task_id)
 
@@ -538,3 +538,171 @@ def test_settings_file_with_bad_values_is_ignored(tmp_path):
     bot = make_bot(tmp_path, schedule_spec="09:00")
     assert bot.cfg.cooldown_seconds == 0 and bot.schedule is None and bot.cfg.allowed_chat_ids == {-300}
     assert isinstance(bot, SpeedBot) and FakeUser(1).id == 1
+
+
+# ---------------------------------------------------------------- 审查发现的问题的回归测试
+
+def test_stopall_cancels_submissions_in_flight(tmp_path):
+    async def run():
+        for auto in (True, False):
+            bot = make_bot(tmp_path / str(auto), backend_select=False, sort_select=False)
+            submit = bot.api.submit_task
+
+            async def submit_then_stop(*a, **kw):  # 提交请求还没返回时管理员发送 /stopall
+                reply, _, _ = await command(bot, "stopall", "/stopall")
+                assert "正在提交" in reply
+                return await submit(*a, **kw)
+
+            bot.api.submit_task = submit_then_stop
+            app = FakeContext().application
+            if auto:
+                await bot.run_auto(app, [-100], "🕘")
+                assert bot.api.calls == ["3399 · 测速 · 自动测速"]  # 剩下的订阅不再提交
+            else:
+                ctx = FakeContext(app=app)
+                await member_submit(bot, ctx)
+                await ctx.run_tasks()
+            assert bot.api.canceled == [TASK_ID]
+
+    asyncio.run(run())
+
+
+def test_stopall_also_stops_round_waiting_for_lock(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        app = FakeContext().application
+        async with bot._auto_lock:  # 管理员手动测速进行中，定时测速排队等待
+            queued = asyncio.ensure_future(bot.run_auto(app, [-100], "🕘", wait_for_lock=True))
+            await asyncio.sleep(0)
+            await command(bot, "stopall", "/stopall")
+        await queued
+        assert bot.api.calls == []
+
+    asyncio.run(run())
+
+
+def test_cooldown_click_keeps_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, daily_limit=0, cooldown_seconds=300, backend_select=False, max_tasks_per_chat=2)
+        ctx = FakeContext()
+        await member_submit(bot, ctx)
+        await member_submit(bot, ctx, text="trojan://pw@b.com:443#B")  # 第二个菜单
+        first, second = list(bot.selections)
+        await click(bot, f"sel:{first}:o:0", user_id=1, ctx=ctx)
+        q = await click(bot, f"sel:{second}:o:0", user_id=1, ctx=ctx)
+        assert "测速太频繁" in q.answers[-1] and second in bot.selections
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_removed_admin_cannot_finish_airport_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        await command(bot, "admin", "/admin add 5")
+        msg, ctx = await speed(bot, user_id=5)
+        sid = next(iter(bot.selections))
+        await command(bot, "admin", "/admin del 5")
+        q = await click(bot, f"sel:{sid}:u:0", user_id=5, ctx=ctx)
+        assert "已不是管理员" in q.answers[-1] and bot.api.submitted is None
+        # 别的管理员点也不能替他提交
+        q = await click(bot, f"sel:{sid}:u:0", user_id=ADMIN, ctx=ctx)
+        assert "已不是管理员" in q.answers[-1] and bot.api.submitted is None
+
+    asyncio.run(run())
+
+
+def test_forum_topic_root_is_not_a_target(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        root = FakeMessage()
+        root.from_user = SimpleNamespace(id=555, is_bot=False)
+        root.forum_topic_created = SimpleNamespace(name="话题")
+        reply, _, _ = await command(bot, "ban", "/ban", private=False, reply_to=root)
+        assert "禁止测速的用户" in reply and not bot.cfg.banned_user_ids
+        reply, _, _ = await command(bot, "admin", "/admin add", private=False, reply_to=root)
+        assert "请提供用户 ID" in reply and not bot.cfg.extra_admin_ids
+
+        upd, msg = update("/ban", ADMIN)
+        msg.is_topic_message, msg.message_thread_id = True, 42
+        msg.reply_to_message = FakeMessage()
+        msg.reply_to_message.message_id = 42
+        msg.reply_to_message.from_user = SimpleNamespace(id=556, is_bot=False)
+        assert bot._target_user(msg, []) is None
+
+    asyncio.run(run())
+
+
+def test_removed_group_gets_no_auto_tests_even_with_auto_chat_ids(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, allowed_chat_ids={-100, -200}, auto_chat_ids={-100, -200})
+        await command(bot, "group", "/group del -200")
+        assert bot._auto_chats() == [-100]
+
+    asyncio.run(run())
+
+
+def test_airport_malformed_urls(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, subscriptions=[("坏的", "https://[abc/sub"), ("带 空格", "https://a.example/s")])
+        reply, _, _ = await command(bot, "airport", "/airport")
+        assert "坏的" in reply and "a.example" in reply
+        reply, _, _ = await command(bot, "airport", "/airport add x https://[abc/sub")
+        assert "格式不正确" in reply and len(bot.cfg.subscriptions) == 2
+        reply, _, _ = await command(bot, "airport", "/airport del 带 空格")
+        assert "已删除" in reply and [n for n, _ in bot.cfg.subscriptions] == ["坏的"]
+
+    asyncio.run(run())
+
+
+def test_ban_list_is_capped(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, banned_user_ids=set(range(1000, 1500)))
+        reply, _, _ = await command(bot, "ban", "/ban")
+        assert "还有 400 人" in reply and len(reply) < 4000
+
+    asyncio.run(run())
+
+
+def test_admin_menu_set_when_admin_first_messages_bot(tmp_path):
+    from telegram.error import BadRequest
+
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        fake = ctx.bot
+        real_set = fake.set_my_commands
+
+        async def chat_not_found(commands, scope=None, **kw):
+            if scope is not None:
+                raise BadRequest("Chat not found")
+            await real_set(commands, scope=scope)
+
+        fake.set_my_commands = chat_not_found
+        await bot.set_commands(fake)  # 启动时管理员还没私聊过 bot
+        assert ADMIN not in fake.commands
+        fake.set_my_commands = real_set
+        upd, _ = dm("/start")
+        await bot.cmd_start(upd, ctx)
+        assert "schedule" in fake.commands[ADMIN]
+
+        # 已不是管理员的人，重启时去掉他的管理菜单
+        await command(bot, "admin", "/admin add 5", ctx=ctx)
+        bot.cfg.extra_admin_ids = set()
+        bot.settings.set("extra_admin_ids", set())
+        bot = restart(bot, tmp_path)
+        await bot.set_commands(fake)
+        assert 5 not in fake.commands and ADMIN in fake.commands
+
+    asyncio.run(run())
+
+
+def test_corrupt_settings_file_stops_startup(tmp_path):
+    import pytest
+
+    (tmp_path / "settings.json").write_text('{"allowed_chat_ids": [-100],\n}', encoding="utf-8")
+    with pytest.raises(SystemExit, match="无法读取设置文件"):
+        make_bot(tmp_path)
+    (tmp_path / "settings.json").write_text("[1, 2]", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        make_bot(tmp_path)
