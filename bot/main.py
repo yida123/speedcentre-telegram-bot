@@ -1002,6 +1002,7 @@ def _split(text: str, size: int) -> list[str]:
 def main() -> None:
     cfg = Config.from_env()
     bot = SpeedBot(cfg)
+    scheduler_task: list[asyncio.Task | None] = [None]
 
     async def _post_init(app: Application) -> None:
         await app.bot.set_my_commands([
@@ -1010,9 +1011,12 @@ def main() -> None:
             BotCommand("backends", "测试后端列表"),
             BotCommand("help", "帮助"),
         ])
-        app.create_task(bot.scheduler(app), name="daily-speedtest")
+        # post_init 时 Application 还没进入运行状态，用 asyncio 直接创建定时任务，关闭时再取消
+        scheduler_task[0] = asyncio.create_task(bot.scheduler(app), name="daily-speedtest")
 
     async def _post_shutdown(app: Application) -> None:
+        if scheduler_task[0]:
+            scheduler_task[0].cancel()
         await bot.api.close()
 
     # 并发处理更新：一个用户的订阅拉取或 API 调用较慢时，不影响其他人（包括删除群里的订阅链接）
