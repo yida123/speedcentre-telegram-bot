@@ -1105,24 +1105,26 @@ class SpeedBot:
     @staticmethod
     async def _send_result_to(reply_to: Message, task_id: str, image: bytes | None, entries: list[dict],
                               caption: str, markup: InlineKeyboardMarkup | None) -> None:
+        # 被回复的消息（命令或进度消息）可能已被定时删除，此时照常发出结果，只是不再引用
+        kw = {"allow_sending_without_reply": True}
         if image:
             try:
                 await reply_to.reply_photo(io.BytesIO(image), caption=caption, parse_mode=ParseMode.HTML,
-                                           reply_markup=markup)
+                                           reply_markup=markup, **kw)
             except BadRequest as e:
                 # 节点多时图片过长，Telegram 不接受为 photo，改为文件发送
                 log.info("以图片发送失败（%s），改为文件发送", e)
                 await reply_to.reply_document(io.BytesIO(image), filename=f"{task_id}.png", caption=caption,
-                                              parse_mode=ParseMode.HTML, reply_markup=markup)
+                                              parse_mode=ParseMode.HTML, reply_markup=markup, **kw)
             return
         if not entries:
-            await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML, reply_markup=markup)
+            await reply_to.reply_text(f"{caption}\n\n无法获取结果。", parse_mode=ParseMode.HTML, reply_markup=markup, **kw)
             return
         # 按行切分，避免截断 HTML 标签
         chunks = _split(f"{caption}\n\n{format_result_text(entries)}", 4000)
         for i, chunk in enumerate(chunks):
             await reply_to.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-                                      reply_markup=markup if i == len(chunks) - 1 else None)
+                                      reply_markup=markup if i == len(chunks) - 1 else None, **kw)
 
 
 def _split(text: str, size: int) -> list[str]:

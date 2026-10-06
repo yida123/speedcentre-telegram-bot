@@ -48,6 +48,7 @@ class FakeMessage:
         return m
 
     async def reply_photo(self, photo, caption=None, **kw):
+        assert kw.get("allow_sending_without_reply") is True  # 被回复的消息可能已被定时删除
         self.photos.append(caption)
         self.photo_markups.append(kw.get("reply_markup"))
 
