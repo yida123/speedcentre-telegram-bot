@@ -870,6 +870,7 @@ class SpeedBot:
                 return
         # 检查之后立即（不经过 await）预占次数和群的任务名额，避免并发提交绕过限制；提交失败再退回
         remaining = self.quota.consume(user.id) if member else None
+        quota_day = self.quota.date  # 退回时只退同一天的扣减
         chats = list(dict.fromkeys([sel.chat_id, *(m.chat_id for m in mirrors)]))
         pending = f"pending-{secrets.token_hex(4)}"
         for c in chats:
@@ -880,7 +881,7 @@ class SpeedBot:
                 async def notify(text: str, **kw) -> None:
                     await self._edit(status, text)
                 if not await self._check_member(user, sel.chat_id, sel.chat_title, application.bot, notify):
-                    self.quota.refund(user.id)
+                    self.quota.refund(user.id, quota_day)
                     return
             await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
             task_name = f"{sel.label} · 测速 · {user.full_name if user else '自动测速'}"[:128]
@@ -891,7 +892,7 @@ class SpeedBot:
                     raise APIError("API 未返回任务 ID")
             except APIError as e:
                 if member:
-                    self.quota.refund(user.id)
+                    self.quota.refund(user.id, quota_day)
                 for m in (status, *mirrors):
                     await self._edit(m, f"❌ 任务 <b>{esc(sel.label)}</b> 提交失败：{esc(e)}")
                 return

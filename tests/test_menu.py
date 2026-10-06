@@ -885,3 +885,16 @@ def test_member_stays_blocked_until_abandoned_parse_finishes(tmp_path, monkeypat
         assert "还在解析中" not in dm.replies[-1][0]
 
     asyncio.run(run())
+
+
+def test_refund_after_midnight_does_not_touch_new_day(tmp_path):
+    q = DailyQuota(str(tmp_path / "u.json"), 3)
+    q._today = lambda: "2026-10-06"
+    q.consume(1)
+    reserved_day = q.date
+    q._today = lambda: "2026-10-07"  # 提交在 0 点后才失败
+    q.consume(1)  # 新一天已经用过一次
+    q.refund(1, reserved_day)
+    assert q.used(1) == 1  # 不能从新一天的次数里退
+    q.refund(1, q.date)
+    assert q.used(1) == 0
