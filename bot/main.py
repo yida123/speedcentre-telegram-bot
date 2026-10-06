@@ -1,4 +1,8 @@
-"""SpeedCentre+ Telegram 群组测速 Bot：在群里测试配置文件中固定的机场订阅。"""
+"""SpeedCentre+ Telegram 群组测速 Bot。
+
+- 每天定时自动测速本机场的固定订阅（subscriptions.yaml），结果发到群里；管理员可随时手动触发。
+- 群成员可以私聊发送任意订阅链接测速（每人每天限次），结果发回群里并 @ 发起人。
+"""
 import asyncio
 import io
 import logging
@@ -7,11 +11,13 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User,
 )
-from telegram.constants import ChatType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler,
@@ -35,8 +41,10 @@ FINAL_STATUSES = {"completed", "failed", "canceled"}
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 SELECTION_TTL = 600  # 选择菜单的有效期（秒）
+DM_TARGET_TTL = 1800  # 私聊绑定的目标群有效期（秒）
 BACKENDS_PER_PAGE = 5
-NOTICE_TTL = 60  # 删除订阅链接后的提示消息自动删除时间（秒）
+NOTICE_TTL = 120  # 群内引导消息自动删除时间（秒）
+MEMBER_LABEL = "群友订阅"  # 群成员私聊提交的订阅在群里显示的名称
 SPEED_PLAN = build_plan(PRESETS["speed"].title, PRESETS["speed"].options)
 # 结果图排序方式（按钮文字, export 的 sort 参数；空字符串为订阅原顺序）
 SORTS = [
@@ -48,14 +56,26 @@ SORTS = [
 
 
 @dataclass
-class Selection:
-    """/speed 发出后、提交任务前的选择状态（订阅 → 后端 → 排序）。"""
-    owner: User
+class DMTarget:
+    """私聊提交的测速结果要发往的群。"""
     chat_id: int
-    status: Message  # 群里的菜单/进度消息
+    title: str
+    updated: float = field(default_factory=time.monotonic)
+
+    def expired(self) -> bool:
+        return time.monotonic() - self.updated > DM_TARGET_TTL
+
+
+@dataclass
+class Selection:
+    """测速提交前的选择状态（订阅 → 后端 → 排序）。"""
+    owner: User | None  # None 表示每日自动测速
+    chat_id: int  # 进度和结果发往的群
+    status: Message  # 菜单所在的消息（群里或私聊）
+    chat_title: str = ""
     name_filter: str | None = None
     slave_arg: str | None = None  # -s 指定的后端，指定后跳过后端选择
-    sub: tuple[str, str] | None = None  # (订阅名, 链接)
+    sub: tuple[str, str] | None = None  # (显示名称, 订阅链接或包含链接的文本)
     nodes: list[dict] = field(default_factory=list)
     skipped: int = 0
     slave: str | None = None  # 选定的后端 ID，None 表示自动选择
@@ -83,21 +103,21 @@ class TaskView:
 
 HELP_TEXT = """<b>机场节点测速 Bot</b>
 
-在群里发送 <code>/speed</code> 测试机场节点当前的速度，依次选择订阅、测试后端和排序方式，
-测速进度和结果图会发在群里。
+<b>测自己的订阅</b>：在群里发送 <code>/speed</code>，点击「🔒 私聊发送订阅」，在私聊里发送订阅链接，
+选择测试后端和排序方式后开始，测速进度和结果图会发回群里并 @ 你。{quota}
+为防止泄露，群里出现的订阅链接会被自动删除。
+
+<b>本机场节点状态</b>：{schedule}管理员可发送 <code>/speed</code> 或 <code>/autotest</code> 手动测速。
 
 <b>命令</b>：
-/speed — 测速（配置了多个订阅时会让你选择）
-/speed 订阅名 — 直接测速指定订阅
-/sub — 查看可测试的订阅和你今日剩余次数
+/speed — 测速
+/sub — 本机场订阅、自动测速时间和你的剩余次数
 /backends — 测试后端列表
 /result 任务ID — 重新获取结果图
 
-<b>可选参数</b>：
-<code>-f 正则</code> 只测名称匹配的节点，例如 <code>/speed -f "香港|HK"</code>
-<code>-s 后端ID或名称</code> 直接指定测试后端
-
-{quota}"""
+<b>可选参数</b>（跟在链接后面）：
+<code>-f 正则</code> 只测名称匹配的节点，例如 <code>-f "香港|HK"</code>
+<code>-s 后端ID或名称</code> 直接指定测试后端"""
 
 
 class SpeedBot:
@@ -105,23 +125,29 @@ class SpeedBot:
         self.cfg = cfg
         self.api = SCPClient(cfg.api_key, cfg.api_base)
         self.quota = DailyQuota(os.path.join(cfg.data_dir, "usage.json"), cfg.daily_limit, cfg.timezone)
+        self.tz = ZoneInfo(cfg.timezone)
         self.running: dict[int, set[str]] = {}  # chat_id -> task_ids
         self.owners: dict[str, int] = {}  # task_id -> user_id
         self.selections: dict[str, Selection] = {}  # 菜单 id -> 选择状态
+        self.dm_targets: dict[int, DMTarget] = {}  # user_id -> 私聊提交的结果去向
         self._backends: tuple[float, list[dict]] | None = None
+        self._auto_lock = asyncio.Lock()
 
     # ------------------------------------------------------------ 权限与次数
 
     def is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.cfg.admin_user_ids
 
+    def group_allowed(self, chat_id: int) -> bool:
+        return not self.cfg.allowed_chat_ids or chat_id in self.cfg.allowed_chat_ids
+
     async def guard(self, update: Update) -> bool:
-        """只在授权群组中可用。"""
+        """群命令只在授权群组中可用。"""
         chat = update.effective_chat
         if chat.type == ChatType.PRIVATE:
-            await update.effective_message.reply_text("请在机场群组里使用此 Bot。")
+            await update.effective_message.reply_text("请在机场群组里使用这个命令。")
             return False
-        if self.cfg.allowed_chat_ids and chat.id not in self.cfg.allowed_chat_ids:
+        if not self.group_allowed(chat.id):
             log.info("拒绝来自 chat=%s 的请求", chat.id)
             await update.effective_message.reply_text(f"本群未授权使用此 Bot。群组 ID：<code>{chat.id}</code>",
                                                       parse_mode=ParseMode.HTML)
@@ -141,15 +167,19 @@ class SpeedBot:
     def _out_of_quota(self) -> str:
         return f"你今天的 {self.cfg.daily_limit} 次测速已用完，明天再来吧。"
 
+    def _schedule_text(self) -> str:
+        if not self.cfg.schedule_times or not self.cfg.subscriptions:
+            return ""
+        times = "、".join(f"{h:02d}:{m:02d}" for h, m in self.cfg.schedule_times)
+        return f"每天 {times} 自动测速并发到群里，"
+
     # ------------------------------------------------------------ 基础命令
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        quota = f"每人每天可测速 {self.cfg.daily_limit} 次，管理员不限。" if self.cfg.daily_limit > 0 else ""
-        if user and update.effective_chat.type != ChatType.PRIVATE:
-            quota += self._quota_text(user.id)
-        await update.effective_message.reply_text(HELP_TEXT.format(quota=quota), parse_mode=ParseMode.HTML,
-                                                  disable_web_page_preview=True)
+        quota = f"每人每天 {self.cfg.daily_limit} 次。" if self.cfg.daily_limit > 0 else ""
+        await update.effective_message.reply_text(
+            HELP_TEXT.format(quota=quota, schedule=self._schedule_text()),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
     async def cmd_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(
@@ -159,10 +189,13 @@ class SpeedBot:
     async def cmd_sub(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.guard(update):
             return
-        names = "\n".join(f"• <code>{esc(name)}</code>" for name, _ in self.cfg.subscriptions)
-        await update.effective_message.reply_text(
-            f"<b>可测试的订阅</b>\n{names}\n\n用法：<code>/speed 订阅名</code>\n{self._quota_text(update.effective_user.id)}",
-            parse_mode=ParseMode.HTML)
+        lines = []
+        if self.cfg.subscriptions:
+            names = "、".join(f"<code>{esc(name)}</code>" for name, _ in self.cfg.subscriptions)
+            lines.append(f"<b>本机场订阅</b>：{names}")
+            lines.append(self._schedule_text().rstrip("，") or "未设置自动测速。")
+        lines.append(f"测自己的订阅：发送 /speed 后私聊发送链接。{self._quota_text(update.effective_user.id)}")
+        await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
     async def cmd_backends(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.guard(update):
@@ -221,7 +254,26 @@ class SpeedBot:
             return
         await q.answer(await self._cancel(task_id, q.from_user.id), show_alert=False)
 
-    # ------------------------------------------------------------ 群内订阅保护
+    # ------------------------------------------------------------ 群内订阅保护与私聊引导
+
+    def _dm_markup(self, bot_username: str, chat_id: int) -> InlineKeyboardMarkup:
+        url = f"https://t.me/{bot_username}?start=g{chat_id}"
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 私聊发送订阅", url=url)]])
+
+    async def _send_dm_prompt(self, msg: Message, user: User, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                              deleted: bool = False) -> None:
+        text = (f"{user.mention_html()} " + ("已删除你发送的订阅/节点链接，避免泄露。\n" if deleted else "")
+                + "请点击下方按钮，在私聊中发送订阅链接测速，结果会发回本群。")
+        markup = self._dm_markup(context.bot.username, chat_id)
+        try:
+            if deleted:
+                notice = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup)
+            else:
+                notice = await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except TelegramError as e:
+            log.warning("发送私聊引导失败：%s", e)
+            return
+        context.application.create_task(self._delete_later(notice, NOTICE_TTL))
 
     async def _delete(self, msg: Message | None) -> bool:
         if msg is None:
@@ -238,25 +290,34 @@ class SpeedBot:
         await self._delete(msg)
 
     async def on_group_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """授权群内出现节点链接或疑似订阅链接时立即删除，避免泄露。"""
+        """授权群内出现节点链接或疑似订阅链接时立即删除，并引导发送者私聊测速。"""
         msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
         if not msg or not self.cfg.delete_sub_message or not user or user.is_bot:
             return
-        if self.cfg.allowed_chat_ids and chat.id not in self.cfg.allowed_chat_ids:
+        if not self.group_allowed(chat.id):
             return
         pattern = self.cfg.sub_link_pattern or DEFAULT_SUB_LINK_PATTERN
         if not contains_sensitive_link(msg.text or msg.caption or "", pattern):
             return
         log.info("删除群 %s 中用户 %s 发送的订阅链接", chat.id, user.id)
-        if await self._delete(msg):
-            try:
-                notice = await context.bot.send_message(
-                    chat.id, f"{user.mention_html()} 已删除你发送的订阅/节点链接，避免泄露。"
-                             f"本群只测速固定订阅，发送 /sub 查看。", parse_mode=ParseMode.HTML)
-                context.application.create_task(self._delete_later(notice, NOTICE_TTL))
-            except TelegramError as e:
-                log.warning("发送提示失败：%s", e)
+        deleted = await self._delete(msg)
+        await self._send_dm_prompt(msg, user, chat.id, context, deleted=deleted)
         raise ApplicationHandlerStop
+
+    async def _is_member(self, bot, chat_id: int, user_id: int) -> bool:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except TelegramError:
+            return False
+        if member.status == ChatMemberStatus.RESTRICTED:
+            return bool(getattr(member, "is_member", False))
+        return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
+
+    async def _chat_title(self, bot, chat_id: int) -> str:
+        try:
+            return (await bot.get_chat(chat_id)).title or str(chat_id)
+        except TelegramError:
+            return str(chat_id)
 
     # ------------------------------------------------------------ /speed
 
@@ -284,36 +345,33 @@ class SpeedBot:
                 or next((s for s in subs if s[0].lower() == name.lower()), None))
 
     async def cmd_speed(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+        if chat.type == ChatType.PRIVATE:
+            await self._private_speed(update, context, context.args or [])
+            return
         if not await self.guard(update):
             return
-        msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
-        # 群里不接受任何订阅链接
-        if any(extract_sources(msg.text or "")):
-            if self.cfg.delete_sub_message:
-                await self._delete(msg)
-            await context.bot.send_message(chat.id, f"{user.mention_html()} 本群只测速固定订阅，请发送 /sub 查看。",
-                                           parse_mode=ParseMode.HTML)
+        has_links = any(extract_sources(msg.text or ""))
+        if not self.is_admin(user.id) or has_links or not self.cfg.subscriptions:
+            # 群成员（以及带链接的命令）：引导私聊发送订阅，避免链接出现在群里
+            deleted = await self._delete(msg) if has_links and self.cfg.delete_sub_message else False
+            await self._send_dm_prompt(msg, user, chat.id, context, deleted=deleted)
             return
+
+        # 管理员：测速本机场的固定订阅
         rest, name_filter, slave = self._parse_args(context.args or [])
-        if name_filter:
-            try:
-                re.compile(name_filter)
-            except re.error:
-                await msg.reply_text("过滤正则无效。")
-                return
-        if self._remaining(user.id) == 0:
-            await msg.reply_text(self._out_of_quota())
+        if name_filter and not self._valid_regex(name_filter):
+            await msg.reply_text("过滤正则无效。")
             return
         if self._busy(chat.id):
             await msg.reply_text("本群已有测速任务在运行，请等待完成后再试。")
             return
-
         sub = None
         if rest:
             sub = self._match_sub(rest[0])
             if not sub:
                 names = "、".join(f"<code>{esc(n)}</code>" for n, _ in self.cfg.subscriptions)
-                await msg.reply_text(f"未找到订阅「{esc(rest[0])}」。可测试的订阅：{names}", parse_mode=ParseMode.HTML)
+                await msg.reply_text(f"未找到订阅「{esc(rest[0])}」。本机场订阅：{names}", parse_mode=ParseMode.HTML)
                 return
         elif len(self.cfg.subscriptions) == 1:
             sub = self.cfg.subscriptions[0]
@@ -330,6 +388,89 @@ class SpeedBot:
         sel = Selection(owner=user, chat_id=chat.id, status=status, name_filter=name_filter, slave_arg=slave, sub=sub)
         if await self._load_nodes(sel):
             await self._next_step(sid, sel, context.application)
+
+    @staticmethod
+    def _valid_regex(pattern: str) -> bool:
+        try:
+            re.compile(pattern)
+            return True
+        except re.error:
+            return False
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理群里「私聊发送订阅」按钮的深链：/start g<群ID>。"""
+        msg, user = update.effective_message, update.effective_user
+        m = re.fullmatch(r"g(-?\d+)(?:_\w+)?", (context.args or [""])[0])
+        if update.effective_chat.type != ChatType.PRIVATE or not m:
+            await self.cmd_help(update, context)
+            return
+        chat_id = int(m.group(1))
+        if not self.group_allowed(chat_id):
+            await msg.reply_text("该群未授权使用此 Bot。")
+            return
+        if not self.is_admin(user.id) and not await self._is_member(context.bot, chat_id, user.id):
+            await msg.reply_text("你不是该群成员，无法为该群测速。")
+            return
+        title = await self._chat_title(context.bot, chat_id)
+        self.dm_targets[user.id] = DMTarget(chat_id, title)
+        await msg.reply_text(
+            f"好的，测速结果将发送到群「{esc(title)}」。{self._quota_text(user.id)}\n\n"
+            f"请直接发送订阅链接或节点链接（可附加 <code>-f 正则</code> 过滤节点、<code>-s 后端ID</code> 指定后端）。",
+            parse_mode=ParseMode.HTML)
+
+    async def on_private_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        msg = update.effective_message
+        if not any(extract_sources(msg.text or "")):
+            await msg.reply_text("请发送订阅链接或节点链接。发送 /help 查看用法。")
+            return
+        await self._private_speed(update, context, (msg.text or "").split())
+
+    async def _resolve_target(self, user: User, bot) -> DMTarget | None:
+        """私聊提交的结果发到哪个群：最近点过按钮的群 > 唯一授权群（需是群成员）。"""
+        target = self.dm_targets.get(user.id)
+        if target and not target.expired():
+            return target
+        if len(self.cfg.allowed_chat_ids) == 1:
+            chat_id = next(iter(self.cfg.allowed_chat_ids))
+            if self.is_admin(user.id) or await self._is_member(bot, chat_id, user.id):
+                target = DMTarget(chat_id, await self._chat_title(bot, chat_id))
+                self.dm_targets[user.id] = target
+                return target
+        return None
+
+    async def _private_speed(self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]) -> None:
+        """群成员在私聊里提交任意订阅测速。"""
+        msg, user = update.effective_message, update.effective_user
+        target = await self._resolve_target(user, context.bot)
+        if not target:
+            await msg.reply_text("请先在机场群里发送 /speed，然后点击「🔒 私聊发送订阅」按钮。")
+            return
+        target.updated = time.monotonic()
+        rest, name_filter, slave = self._parse_args(args)
+        subs, uris = extract_sources(" ".join(rest))
+        if not subs and not uris and msg.reply_to_message:
+            reply = msg.reply_to_message
+            subs, uris = extract_sources(reply.text or reply.caption or "")
+        if not subs and not uris:
+            await msg.reply_text("请发送订阅链接或节点链接，例如：\n<code>https://example.com/sub -f 香港</code>",
+                                 parse_mode=ParseMode.HTML)
+            return
+        if name_filter and not self._valid_regex(name_filter):
+            await msg.reply_text("过滤正则无效。")
+            return
+        if self._remaining(user.id) == 0:
+            await msg.reply_text(self._out_of_quota())
+            return
+        if self._busy(target.chat_id):
+            await msg.reply_text("群里已有测速任务在运行，请等待完成后再试。")
+            return
+
+        status = await msg.reply_text("📥 正在解析节点…")
+        sel = Selection(owner=user, chat_id=target.chat_id, chat_title=target.title, status=status,
+                        name_filter=name_filter, slave_arg=slave, sub=(MEMBER_LABEL, " ".join(subs + uris)))
+        self._purge_selections()
+        if await self._load_nodes(sel):
+            await self._next_step(secrets.token_hex(4), sel, context.application)
 
     async def _load_nodes(self, sel: Selection) -> bool:
         """拉取订阅、解析节点，并确定可选后端。失败时在状态消息里说明并返回 False。"""
@@ -383,6 +524,85 @@ class SpeedBot:
         self.selections[sid] = sel
         await self._render_menu(sid, sel)
 
+    # ------------------------------------------------------------ 每日自动测速
+
+    def seconds_until_next_run(self, now: datetime | None = None) -> float | None:
+        """距离下一个 SCHEDULE_TIMES 时间点的秒数；未配置时返回 None。"""
+        if not self.cfg.schedule_times:
+            return None
+        now = now or datetime.now(self.tz)
+        candidates = []
+        for days in (0, 1):
+            day = (now + timedelta(days=days)).date()
+            for h, m in self.cfg.schedule_times:
+                t = datetime(day.year, day.month, day.day, h, m, tzinfo=self.tz)
+                if t > now:
+                    candidates.append(t)
+        return (min(candidates) - now).total_seconds()
+
+    def _auto_chats(self) -> list[int]:
+        return sorted(self.cfg.auto_chat_ids or self.cfg.allowed_chat_ids)
+
+    async def scheduler(self, application: Application) -> None:
+        """按 SCHEDULE_TIMES 每天自动测速本机场订阅并发到群里。"""
+        if not self.cfg.subscriptions or not self._auto_chats():
+            log.info("未配置本机场订阅或目标群，不启用每日自动测速")
+            return
+        while True:
+            delay = self.seconds_until_next_run()
+            if delay is None:
+                return
+            log.info("下次自动测速在 %.0f 秒后", delay)
+            await asyncio.sleep(delay)
+            try:
+                await self.run_auto(application, self._auto_chats(), "🕘 每日自动测速")
+            except Exception:
+                log.exception("每日自动测速出错")
+            await asyncio.sleep(1)  # 避免同一分钟内重复触发
+
+    async def run_auto(self, application: Application, chat_ids: list[int], title: str) -> bool:
+        """依次测速所有本机场订阅，每个订阅等上一个完成后再开始。已有自动测速在进行时返回 False。"""
+        if self._auto_lock.locked():
+            return False
+        async with self._auto_lock:
+            for chat_id in chat_ids:
+                for sub in self.cfg.subscriptions:
+                    try:
+                        status = await application.bot.send_message(
+                            chat_id, f"{title} · 任务 <b>{esc(sub[0])}</b> 正在解析节点…", parse_mode=ParseMode.HTML)
+                    except TelegramError as e:
+                        log.warning("向群 %s 发送自动测速消息失败：%s", chat_id, e)
+                        break
+                    sel = Selection(owner=None, chat_id=chat_id, status=status, sub=sub,
+                                    slave_arg=None, sort="avg_speed_desc")
+                    if not await self._load_nodes(sel):
+                        continue
+                    if self.cfg.auto_slave_id:
+                        chosen = self._match_backend(sel.backends, self.cfg.auto_slave_id)
+                        if chosen:
+                            sel.slave, sel.slave_name = chosen["client_id"], chosen.get("display_name")
+                    await self._submit(sel, application, requester=title, wait=True)
+        return True
+
+    async def cmd_autotest(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """管理员手动触发一次本机场订阅测速（与每日自动测速相同）。"""
+        if not await self.guard(update):
+            return
+        msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+        if not self.is_admin(user.id):
+            await msg.reply_text("只有管理员可以手动触发本机场测速。")
+            return
+        if not self.cfg.subscriptions:
+            await msg.reply_text("还没有配置本机场订阅（subscriptions.yaml）。")
+            return
+        if self._auto_lock.locked():
+            await msg.reply_text("本机场测速正在进行中，请等待完成。")
+            return
+        names = "、".join(n for n, _ in self.cfg.subscriptions)
+        await msg.reply_text(f"开始测速本机场订阅：{esc(names)}", parse_mode=ParseMode.HTML)
+        context.application.create_task(
+            self.run_auto(context.application, [chat.id], f"🛠 管理员 {user.mention_html()} 手动测速"))
+
     # ------------------------------------------------------------ 选择菜单
 
     def _purge_selections(self) -> None:
@@ -429,8 +649,7 @@ class SpeedBot:
             return InlineKeyboardButton(label, callback_data=f"sel:{sid}:{action}")
 
         rows: list[list[InlineKeyboardButton]] = []
-        stop = btn("❌ 终止操作", "x")
-        who = sel.owner.mention_html()
+        who = sel.owner.mention_html() if sel.owner else ""
         if sel.page == "subs":
             text = f"📋 <b>选择要测速的订阅</b> · {who}"
             buttons = [btn(name[:30], f"u:{n}") for n, (name, _) in enumerate(self.cfg.subscriptions)]
@@ -455,7 +674,9 @@ class SpeedBot:
                     f"订阅名：<b>{esc(sel.label)}</b>\n选中后端：<b>{esc(sel.slave or '自动选择')}</b>")
             buttons = [btn(label, f"o:{n}") for n, (label, _) in enumerate(SORTS)]
             rows += [buttons[:1], buttons[1:2], buttons[2:]]
-        rows.append([stop])
+        if sel.chat_id != sel.status.chat_id and sel.page != "subs":
+            text += f"\n结果将发送到群「{esc(sel.chat_title)}」"
+        rows.append([btn("❌ 终止操作", "x")])
         await self._edit(sel.status, text, InlineKeyboardMarkup(rows))
 
     async def _on_select(self, q, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -503,23 +724,27 @@ class SpeedBot:
             await q.answer()
             return
         if self._busy(sel.chat_id):
-            await q.answer("本群已有测速任务在运行，请等待完成后再试。", show_alert=True)
+            await q.answer("群里已有测速任务在运行，请等待完成后再试。", show_alert=True)
             return
         await q.answer()
         await self._next_step(sid, sel, context.application)
 
     # ------------------------------------------------------------ 提交与跟踪
 
-    async def _submit(self, sel: Selection, application: Application) -> None:
+    async def _submit(self, sel: Selection, application: Application, requester: str | None = None,
+                      wait: bool = False) -> None:
+        """提交测速任务。wait=True 时（自动测速）等待任务完成，且不检查次数和并发。"""
         user, status = sel.owner, sel.status
-        if self._remaining(user.id) == 0:
-            await self._edit(status, self._out_of_quota())
-            return
-        if self._busy(sel.chat_id):
-            await self._edit(status, "本群已有测速任务在运行，请等待完成后再试。")
-            return
+        member = user is not None and not self.is_admin(user.id)
+        if not wait:
+            if member and self._remaining(user.id) == 0:
+                await self._edit(status, self._out_of_quota())
+                return
+            if self._busy(sel.chat_id):
+                await self._edit(status, "群里已有测速任务在运行，请等待完成后再试。")
+                return
         await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
-        task_name = f"{sel.label} · 测速 · {user.full_name}"[:128]
+        task_name = f"{sel.label} · 测速 · {user.full_name if user else '自动测速'}"[:128]
         try:
             data = await self.api.submit_task(task_name, sel.nodes, list(SPEED_PLAN.matrices), slave_id=sel.slave)
         except APIError as e:
@@ -530,10 +755,11 @@ class SpeedBot:
             await self._edit(status, "❌ 提交任务失败：API 未返回任务 ID")
             return
 
-        remaining = None if self.is_admin(user.id) else self.quota.consume(user.id)
+        remaining = self.quota.consume(user.id) if member else None
         self.running.setdefault(sel.chat_id, set()).add(task_id)
-        self.owners[task_id] = user.id
-        info = f"发起人 {user.mention_html()} · 节点 {len(sel.nodes)} 个"
+        if user:
+            self.owners[task_id] = user.id
+        info = f"{requester or '发起人 ' + user.mention_html()} · 节点 {len(sel.nodes)} 个"
         if sel.name_filter:
             info += f" · 过滤 <code>{esc(sel.name_filter)}</code>"
         if remaining is not None:
@@ -541,8 +767,24 @@ class SpeedBot:
         info += f"\nID <code>{task_id}</code>"
         sort = "avg_speed_desc" if sel.sort is None else (sel.sort or None)
         view = TaskView(task_id, sel.label, info, sel.slave_name or sel.slave or "自动选择", sort)
-        log.info("chat=%s user=%s 提交测速 %s（订阅 %s，%d 节点）", sel.chat_id, user.id, task_id, sel.label, len(sel.nodes))
-        application.create_task(self._watch(status, view, sel.chat_id), name=f"watch-{task_id}")
+
+        if sel.chat_id != status.chat_id:
+            # 私聊提交：进度和结果发到群里并 @ 发起人
+            await self._edit(status, f"✅ 已提交，进度和结果将发送到群「{esc(sel.chat_title)}」。")
+            try:
+                status = await application.bot.send_message(sel.chat_id, self._task_text(view, "pending"),
+                                                            parse_mode=ParseMode.HTML)
+            except TelegramError as e:
+                log.warning("向群 %s 发送任务消息失败：%s", sel.chat_id, e)
+                await self._edit(sel.status, f"⚠️ 无法在群里发送消息（{esc(e)}），结果改为发到这里。")
+                status = sel.status
+        log.info("chat=%s user=%s 提交测速 %s（%s，%d 节点）", sel.chat_id, user.id if user else "auto",
+                 task_id, sel.label, len(sel.nodes))
+        watch = self._watch(status, view, sel.chat_id)
+        if wait:
+            await watch
+        else:
+            application.create_task(watch, name=f"watch-{task_id}")
 
     async def _edit(self, msg: Message, text: str, markup=None) -> None:
         try:
@@ -691,18 +933,18 @@ def _split(text: str, size: int) -> list[str]:
     return chunks
 
 
-async def _post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("speed", "测速机场节点"),
-        BotCommand("sub", "可测试的订阅与剩余次数"),
-        BotCommand("backends", "测试后端列表"),
-        BotCommand("help", "帮助"),
-    ])
-
-
 def main() -> None:
     cfg = Config.from_env()
     bot = SpeedBot(cfg)
+
+    async def _post_init(app: Application) -> None:
+        await app.bot.set_my_commands([
+            BotCommand("speed", "测速（私聊发送订阅）"),
+            BotCommand("sub", "本机场订阅与剩余次数"),
+            BotCommand("backends", "测试后端列表"),
+            BotCommand("help", "帮助"),
+        ])
+        app.create_task(bot.scheduler(app), name="daily-speedtest")
 
     async def _post_shutdown(app: Application) -> None:
         await bot.api.close()
@@ -712,16 +954,20 @@ def main() -> None:
     # 先于其他处理器检查群消息中的订阅链接
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION),
                                    bot.on_group_message), group=-1)
-    app.add_handler(CommandHandler(["start", "help"], bot.cmd_help))
+    app.add_handler(CommandHandler("start", bot.cmd_start))
+    app.add_handler(CommandHandler("help", bot.cmd_help))
     app.add_handler(CommandHandler("id", bot.cmd_id))
     app.add_handler(CommandHandler("speed", bot.cmd_speed))
+    app.add_handler(CommandHandler("autotest", bot.cmd_autotest))
     app.add_handler(CommandHandler("sub", bot.cmd_sub))
     app.add_handler(CommandHandler("backends", bot.cmd_backends))
     app.add_handler(CommandHandler("result", bot.cmd_result))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, bot.on_private_text))
     app.add_handler(CallbackQueryHandler(bot.on_callback, pattern=r"^(cancel|sel):"))
-    log.info("Bot 启动，订阅：%s，授权群组：%s，每日次数：%s",
-             "、".join(n for n, _ in cfg.subscriptions), cfg.allowed_chat_ids or "不限",
-             cfg.daily_limit if cfg.daily_limit > 0 else "不限")
+    log.info("Bot 启动，本机场订阅：%s，自动测速：%s，授权群组：%s，每日次数：%s",
+             "、".join(n for n, _ in cfg.subscriptions) or "无",
+             "、".join(f"{h:02d}:{m:02d}" for h, m in cfg.schedule_times) or "未启用",
+             cfg.allowed_chat_ids or "不限", cfg.daily_limit if cfg.daily_limit > 0 else "不限")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
