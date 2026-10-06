@@ -64,3 +64,13 @@ class DailyQuota:
         self.counts[key] = self.counts.get(key, 0) + 1
         self._save()
         return max(0, self.limit - self.counts[key])
+
+    def refund(self, user_id: int) -> None:
+        """退回一次（提交失败时）。"""
+        if self.limit <= 0:
+            return
+        self._roll()
+        key = str(user_id)
+        if self.counts.get(key, 0) > 0:
+            self.counts[key] -= 1
+            self._save()

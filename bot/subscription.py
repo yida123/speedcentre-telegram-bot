@@ -367,7 +367,8 @@ async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.A
                         body += chunk
                         if len(body) > MAX_SUB_SIZE:
                             raise SubscriptionError("获取订阅失败：内容过大")
-                    return parse_content(body.decode("utf-8", errors="ignore"))
+                    # 解析可能很耗 CPU（大订阅、恶意构造的 YAML），放到线程里，不阻塞事件循环
+                    return await asyncio.to_thread(parse_content, body.decode("utf-8", errors="ignore"))
             except httpx.HTTPError as e:
                 raise SubscriptionError(f"获取订阅失败：{type(e).__name__}") from e
     raise SubscriptionError("获取订阅失败：重定向次数过多")
@@ -398,10 +399,18 @@ def contains_sensitive_link(text: str, sub_pattern: str = DEFAULT_SUB_LINK_PATTE
     return any(pattern.search(u) for u in subs)
 
 
+def match_keywords(name: str, keywords: str | None) -> bool:
+    """节点名是否包含任一关键词（用 | 分隔，不区分大小写）。不使用正则，避免恶意表达式拖垮 bot。"""
+    if not keywords:
+        return True
+    lowered = name.lower()
+    return any(k and k.lower() in lowered for k in keywords.split("|"))
+
+
 def to_api_nodes(proxies: list[dict], name_filter: str | None = None, limit: int | None = None) -> tuple[list[dict], int]:
-    """过滤并转换成 API 的 Node 列表。返回 (nodes, 被跳过的数量)。"""
-    pattern = re.compile(name_filter, re.IGNORECASE) if name_filter else None
+    """过滤并转换成 API 的 Node 列表。name_filter 为 | 分隔的关键词。返回 (nodes, 被跳过的数量)。"""
     seen: set[str] = set()
+    next_suffix: dict[str, int] = {}
     nodes, skipped = [], 0
     for p in proxies:
         ptype = str(p.get("type", "")).lower()
@@ -409,16 +418,19 @@ def to_api_nodes(proxies: list[dict], name_filter: str | None = None, limit: int
         if ptype not in SUPPORTED_TYPES or not p.get("server"):
             skipped += 1
             continue
-        if pattern and not pattern.search(name):
+        if not match_keywords(name, name_filter):
             continue
-        # 节点重名会让结果难以区分，追加序号
-        base, i = name, 2
-        while name in seen:
-            name, i = f"{base} ({i})", i + 1
+        if limit is not None and len(nodes) >= limit:
+            skipped += 1  # 超出数量上限的节点只计数，不再转换
+            continue
+        # 节点重名会让结果难以区分，追加序号（记住每个名字用到的序号，避免大量重名时反复扫描）
+        if name in seen:
+            base, i = name, next_suffix.get(name, 2)
+            while f"{base} ({i})" in seen:
+                i += 1
+            next_suffix[base] = i + 1
+            name = f"{base} ({i})"
         seen.add(name)
         p = {**p, "name": name}
         nodes.append({"Name": name, "Payload": yaml.safe_dump(p, allow_unicode=True, sort_keys=False)})
-    if limit is not None and len(nodes) > limit:
-        skipped += len(nodes) - limit
-        nodes = nodes[:limit]
     return nodes, skipped

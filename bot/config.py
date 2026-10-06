@@ -97,7 +97,8 @@ class Config:
             api_base=os.environ.get("SCP_API_BASE", cls.api_base).rstrip("/"),
             subscriptions=load_subscriptions(os.environ.get("SUBSCRIPTIONS_FILE", "subscriptions.yaml")),
             daily_limit=int(os.environ.get("DAILY_LIMIT", "3")),
-            schedule_times=parse_times(os.environ.get("SCHEDULE_TIMES", "")),
+            # 未设置时默认每天 09:00；显式设为空则关闭自动测速
+            schedule_times=parse_times(os.environ.get("SCHEDULE_TIMES", "09:00")),
             auto_chat_ids=_int_set(os.environ.get("AUTO_CHAT_IDS", "")),
             auto_slave_id=os.environ.get("AUTO_SLAVE_ID", ""),
             data_dir=os.environ.get("DATA_DIR", "data"),
