@@ -142,6 +142,7 @@ def make_bot(tmp_path, **kw):
     kw.setdefault("subscriptions", SUBS)
     kw.setdefault("allowed_chat_ids", {-100})
     kw.setdefault("admin_user_ids", {ADMIN})
+    kw.setdefault("daily_limit", 3)  # 次数限制相关的测试按每天 3 次来验证；Config 默认不限
     bot = SpeedBot(Config(bot_token="t", api_key="k", data_dir=str(tmp_path), **kw))
     bot.api = FakeAPI()
     return bot
@@ -988,3 +989,29 @@ def test_share_link_uses_web_share_page(tmp_path, monkeypatch):
     for value, expected in (("", Config.share_url), ("off", ""), ("https://x/s?id={uuid}", "https://x/s?id={uuid}")):
         monkeypatch.setenv("SCP_SHARE_URL", value)
         assert Config.from_env().share_url == expected
+
+
+def test_unlimited_by_default(tmp_path, monkeypatch):
+    assert Config(bot_token="t", api_key="k").daily_limit == 0
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    monkeypatch.delenv("DAILY_LIMIT", raising=False)
+    assert Config.from_env().daily_limit == 0
+    monkeypatch.setenv("DAILY_LIMIT", "")
+    assert Config.from_env().daily_limit == 0
+
+    async def run():
+        bot = make_bot(tmp_path, daily_limit=0, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        for _ in range(5):  # 想测就测
+            bot.api.submitted = None
+            await member_submit(bot, ctx)
+            assert bot.api.submitted
+            await ctx.run_tasks()
+        assert "今日剩余" not in ctx.bot.sent[-1][1]
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        assert "不受限制" in msg.replies[-1][0]
+
+    asyncio.run(run())

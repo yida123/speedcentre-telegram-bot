@@ -74,7 +74,7 @@ class Config:
     api_key: str
     api_base: str = "https://api.speedcentre.plus"
     subscriptions: list[tuple[str, str]] = field(default_factory=list)
-    daily_limit: int = 3
+    daily_limit: int = 0  # 群成员每人每天测速次数，0 表示不限
     schedule_times: list[tuple[int, int]] = field(default_factory=list)
     auto_chat_ids: set[int] = field(default_factory=set)
     auto_slave_id: str = ""
@@ -136,7 +136,7 @@ class Config:
             api_key=api_key,
             api_base=os.environ.get("SCP_API_BASE", cls.api_base).rstrip("/"),
             subscriptions=load_subscriptions(os.environ.get("SUBSCRIPTIONS_FILE", "subscriptions.yaml")),
-            daily_limit=int(os.environ.get("DAILY_LIMIT", "3")),
+            daily_limit=int(os.environ.get("DAILY_LIMIT") or 0),
             # 未设置时默认每天 09:00；显式设为空则关闭自动测速
             schedule_times=parse_times(os.environ.get("SCHEDULE_TIMES", "09:00")),
             auto_chat_ids=_int_set(os.environ.get("AUTO_CHAT_IDS", "")),
