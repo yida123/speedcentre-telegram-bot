@@ -62,7 +62,7 @@ subscriptions:
 ### 1. 准备 Bot
 
 在 [@BotFather](https://t.me/BotFather) 创建 Bot 拿到 Token，把 Bot 拉进群，
-并**设为群管理员、授予「删除消息」权限**（自动删除订阅链接需要该权限，管理员身份也能让 Bot 看到群内所有消息）。
+并**设为群管理员、授予「删除消息」权限**（自动删除订阅链接、10 秒后清理提示和命令都需要该权限，管理员身份也能让 Bot 看到群内所有消息）。群里最终只保留测速结果图。
 
 服务器需要能访问 Telegram、`api.speedcentre.plus` 以及订阅地址。国内服务器请在 `.env` 里加
 `HTTPS_PROXY=http://代理地址:端口`。
@@ -149,6 +149,7 @@ python -m bot.main
   [SpeedCentre+ 官方对接示例](https://scx.gitbook.io/sc/scp-docs/speedcentre+-copilot-shi-yong)一致。每次提交测速都会带上完整配置——
   API 文档把 `configs` 标为可选，但后端当前在省略它时会异常断连。`SPEED_DOWNLOAD_URL` 填 `INTL_ANTIHIJACK` 可启用
   [内置反劫持测速](https://scx.gitbook.io/sc/scp-docs/liao-jie-geng-duo)，也支持自定义反劫持和 Telegram 下载测速
+- `AUTO_DELETE_SECONDS`：群里除测速结果外的消息（提示、菜单、进度消息、用户发的命令）多少秒后删除，默认 10，`0` 表示不删。进度消息在结果图发出后才开始计时，私聊消息不删
 - `DELETE_SUB_MESSAGE`：群里出现订阅/节点链接时自动删除（默认开启）
 - `SUB_LINK_PATTERN`：自定义“疑似订阅链接”的判断正则
 

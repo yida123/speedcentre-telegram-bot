@@ -1015,3 +1015,74 @@ def test_unlimited_by_default(tmp_path, monkeypatch):
         assert "不受限制" in msg.replies[-1][0]
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 群里除测速结果外的消息定时删除
+
+def test_group_command_and_reply_are_deleted_dm_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        reply = msg.replies[-1][2]
+        assert not msg.deleted and not reply.deleted
+        await asyncio.sleep(0.05)
+        assert msg.deleted and reply.deleted  # 用户的命令和 bot 的回复都删掉
+
+        dm = await member_submit(bot, FakeContext(), text="你好")  # 私聊消息不删
+        await asyncio.sleep(0.05)
+        assert not dm.deleted and not dm.replies[-1][2].deleted
+
+    asyncio.run(run())
+
+
+def test_progress_deleted_after_result_result_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, backend_select=False, sort_select=False)
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        progress = app.bot.sent[0][3]
+        assert progress.photos  # 结果图已作为回复发出（结果图本身不会被安排删除）
+        await asyncio.sleep(0.05)
+        assert progress.deleted  # 进度消息在结果发出后删除
+
+        ctx = FakeContext()
+        await member_submit(bot, ctx)  # 群员私聊提交：私聊里的“已提交”保留，群里的进度消息结果发出后删除
+        group_msg = ctx.bot.sent[-1][3]
+        await ctx.run_tasks()
+        await asyncio.sleep(0.05)
+        assert group_msg.photos and group_msg.deleted
+
+    asyncio.run(run())
+
+
+def test_terminated_and_failed_menus_are_deleted(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)  # 管理员在群里打开菜单
+        status = msg.replies[-1][2]
+        sid = next(iter(bot.selections))
+        await asyncio.sleep(0.05)
+        assert not status.deleted  # 还在使用中的菜单不删
+        await click(bot, f"sel:{sid}:x", ctx=ctx)
+        await asyncio.sleep(0.05)
+        assert status.deleted
+
+    asyncio.run(run())
+
+
+def test_auto_delete_can_be_disabled(tmp_path, monkeypatch):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0)
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        await asyncio.sleep(0.05)
+        assert not msg.deleted and not msg.replies[-1][2].deleted
+
+    asyncio.run(run())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    for value, expected in (("", 10.0), ("0", 0.0), ("30", 30.0)):
+        monkeypatch.setenv("AUTO_DELETE_SECONDS", value)
+        assert Config.from_env().auto_delete_seconds == expected

@@ -95,6 +95,8 @@ class Config:
     delete_sub_message: bool = True
     sub_link_pattern: str = ""
     poll_interval: float = 5.0
+    # 群里除测速结果外的消息（提示、菜单、进度、用户的命令）多少秒后删除；0 表示不删
+    auto_delete_seconds: float = 10.0
     task_timeout: float = 1800.0
     # 测速配置（提交任务时的 configs，同 miaospeed 的 SlaveRequestConfigs）。
     # 默认值取自 SpeedCentre+ 官方文档「SpeedCentre+ Copilot - 使用」中的对接示例
@@ -157,6 +159,7 @@ class Config:
             delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "true")),
             sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),
+            auto_delete_seconds=float(os.environ.get("AUTO_DELETE_SECONDS") or cls.auto_delete_seconds),
             task_timeout=float(os.environ.get("TASK_TIMEOUT", "1800")),
             speed_download_url=os.environ.get("SPEED_DOWNLOAD_URL") or cls.speed_download_url,
             speed_duration=int(os.environ.get("SPEED_DURATION") or cls.speed_duration),
