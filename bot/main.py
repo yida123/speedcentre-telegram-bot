@@ -18,7 +18,7 @@ from telegram import (
     BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User,
 )
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application, ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler,
     filters,
@@ -29,8 +29,8 @@ from .config import Config
 from .formatter import PRESETS, build_plan, esc, format_result_text, format_stats, progress_bar
 from .quota import DailyQuota
 from .subscription import (
-    DEFAULT_SUB_LINK_PATTERN, SubscriptionError, contains_sensitive_link, extract_sources, fetch_subscription,
-    parse_uri, to_api_nodes,
+    DEFAULT_SUB_LINK_PATTERN, MAX_PROXIES, PARSE_POOL, SubscriptionError, contains_sensitive_link, extract_sources,
+    fetch_subscription, parse_uri, to_api_nodes,
 )
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -44,7 +44,8 @@ SELECTION_TTL = 600  # 选择菜单的有效期（秒）
 DM_TARGET_TTL = 1800  # 私聊绑定的目标群有效期（秒）
 BACKENDS_PER_PAGE = 5
 NOTICE_TTL = 120  # 群内引导消息自动删除时间（秒）
-SUB_FETCH_TIMEOUT = 60  # 拉取单个订阅的总超时（秒），防止慢速服务器拖住 bot
+SUB_FETCH_TIMEOUT = 60  # 拉取一次提交中所有订阅的总超时（秒），防止慢速服务器拖住 bot
+MAX_SUB_URLS = 5  # 一次最多拉取的订阅链接数
 MAX_FILTER_LEN = 64
 MEMBER_LABEL = "群友订阅"  # 群成员私聊提交的订阅在群里显示的名称
 SPEED_PLAN = build_plan(PRESETS["speed"].title, PRESETS["speed"].options)
@@ -134,6 +135,7 @@ class SpeedBot:
         self.dm_targets: dict[int, DMTarget] = {}  # user_id -> 私聊提交的结果去向
         self._backends: tuple[float, list[dict]] | None = None
         self._auto_lock = asyncio.Lock()
+        self._loading: set[int] = set()  # 正在解析订阅的群成员，每人同时只能有一个
 
     # ------------------------------------------------------------ 权限与次数
 
@@ -306,14 +308,32 @@ class SpeedBot:
         await self._send_dm_prompt(msg, user, chat.id, context, deleted=deleted)
         raise ApplicationHandlerStop
 
-    async def _is_member(self, bot, chat_id: int, user_id: int) -> bool:
+    async def _is_member(self, bot, chat_id: int, user_id: int) -> bool | None:
+        """True/False：确定是/不是群成员；None：暂时查询失败（超时、网络、限流），不能据此判定已退群。"""
         try:
             member = await bot.get_chat_member(chat_id, user_id)
-        except TelegramError:
+        except (BadRequest, Forbidden):  # 用户或群无效、bot 已不在群里：确定不能测速
             return False
+        except TelegramError as e:
+            log.warning("查询群 %s 成员 %s 失败：%s", chat_id, user_id, e)
+            return None
         if member.status == ChatMemberStatus.RESTRICTED:
             return bool(getattr(member, "is_member", False))
         return member.status in (ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.MEMBER)
+
+    async def _check_member(self, user: User, chat_id: int, chat_title: str, bot, notify) -> bool:
+        """群成员每次发链接和每次提交都重新确认身份，被踢出或退群的人不能继续往群里发测速。"""
+        if self.is_admin(user.id):
+            return True
+        member = await self._is_member(bot, chat_id, user.id)
+        if member:
+            return True
+        if member is None:
+            await notify("暂时无法确认你的群成员身份，请稍后再试。")
+        else:
+            self.dm_targets.pop(user.id, None)
+            await notify(f"你已不是群「{esc(chat_title)}」的成员，无法为该群测速。", parse_mode=ParseMode.HTML)
+        return False
 
     async def _chat_title(self, bot, chat_id: int) -> str:
         try:
@@ -407,9 +427,14 @@ class SpeedBot:
         if not self.group_allowed(chat_id):
             await msg.reply_text("该群未授权使用此 Bot。")
             return
-        if not self.is_admin(user.id) and not await self._is_member(context.bot, chat_id, user.id):
-            await msg.reply_text("你不是该群成员，无法为该群测速。")
-            return
+        if not self.is_admin(user.id):
+            member = await self._is_member(context.bot, chat_id, user.id)
+            if member is None:
+                await msg.reply_text("暂时无法确认你的群成员身份，请稍后再点一次按钮。")
+                return
+            if not member:
+                await msg.reply_text("你不是该群成员，无法为该群测速。")
+                return
         title = await self._chat_title(context.bot, chat_id)
         self.dm_targets[user.id] = DMTarget(chat_id, title)
         await msg.reply_text(
@@ -457,10 +482,7 @@ class SpeedBot:
         if name_filter and not self._valid_filter(name_filter):
             await msg.reply_text(f"过滤关键词太长（最多 {MAX_FILTER_LEN} 个字符）。")
             return
-        if not self.is_admin(user.id) and not await self._is_member(context.bot, target.chat_id, user.id):
-            # 每次提交都重新确认群成员身份，被踢出或退群的人不能继续往群里发测速
-            self.dm_targets.pop(user.id, None)
-            await msg.reply_text(f"你已不是群「{esc(target.title)}」的成员，无法为该群测速。", parse_mode=ParseMode.HTML)
+        if not await self._check_member(user, target.chat_id, target.title, context.bot, msg.reply_text):
             return
         if self._remaining(user.id) == 0:
             await msg.reply_text(self._out_of_quota())
@@ -469,34 +491,56 @@ class SpeedBot:
             await msg.reply_text("群里已有测速任务在运行，请等待完成后再试。")
             return
 
-        status = await msg.reply_text("📥 正在解析节点…")
-        sel = Selection(owner=user, chat_id=target.chat_id, chat_title=target.title, status=status,
-                        name_filter=name_filter, slave_arg=slave, sub=(MEMBER_LABEL, " ".join(subs + uris)))
-        self._purge_selections()
-        if await self._prepare(sel):
-            await self._next_step(secrets.token_hex(4), sel, context.application)
+        # 每人同时只能解析一个订阅（检查和登记之间没有 await，并发消息也只有一个能通过）
+        if user.id in self._loading:
+            await msg.reply_text("你的上一个订阅还在解析中，请等它完成后再发送。")
+            return
+        self._loading.add(user.id)
+        try:
+            status = await msg.reply_text("📥 正在解析节点…")
+            sel = Selection(owner=user, chat_id=target.chat_id, chat_title=target.title, status=status,
+                            name_filter=name_filter, slave_arg=slave, sub=(MEMBER_LABEL, " ".join(subs + uris)))
+            self._purge_selections()
+            if await self._prepare(sel):
+                await self._next_step(secrets.token_hex(4), sel, context.application)
+        finally:
+            self._loading.discard(user.id)
 
     async def _load_nodes(self, sel: Selection) -> str | None:
         """拉取订阅、解析节点，并确定可选后端。成功返回 None，失败返回要显示的错误信息。"""
         subs, uris = extract_sources(sel.sub[1])
         proxies: list[dict] = []
         errors: list[str] = []
-        for uri in uris:
+        subs = list(dict.fromkeys(subs))
+        if len(subs) > MAX_SUB_URLS:
+            errors.append(f"一次最多测试 {MAX_SUB_URLS} 个订阅，其余已忽略")
+            subs = subs[:MAX_SUB_URLS]
+        for uri in list(dict.fromkeys(uris))[:MAX_PROXIES]:
             p = parse_uri(uri)
             if p:
                 proxies.append(p)
             else:
                 errors.append("有节点链接无法解析")
-        for url in subs:
-            try:
-                got = await asyncio.wait_for(fetch_subscription(url), SUB_FETCH_TIMEOUT)
-                if not got:
-                    errors.append("订阅中没有找到节点")
-                proxies.extend(got)
-            except TimeoutError:
-                errors.append("获取订阅超时")
-            except SubscriptionError as e:
-                errors.append(str(e))
+        # 本机场订阅（自动测速、管理员）用默认线程池，群成员的订阅用专用小线程池，互不影响
+        trusted = sel.owner is None or self.is_admin(sel.owner.id)
+        executor = None if trusted else PARSE_POOL
+
+        async def fetch_all() -> None:
+            for url in subs:
+                if len(proxies) >= MAX_PROXIES:
+                    break
+                try:
+                    got = await fetch_subscription(url, executor=executor)
+                    if not got:
+                        errors.append("订阅中没有找到节点")
+                    proxies.extend(got[:MAX_PROXIES - len(proxies)])
+                except SubscriptionError as e:
+                    errors.append(str(e))
+
+        try:
+            await asyncio.wait_for(fetch_all(), SUB_FETCH_TIMEOUT)  # 所有订阅共用一个总超时
+        except asyncio.TimeoutError:  # Python 3.10 中与内置 TimeoutError 不是同一个类
+            errors.append("获取订阅超时")
         # 节点很多时转换也比较耗时，放到线程里
         sel.nodes, sel.skipped = await asyncio.to_thread(to_api_nodes, proxies, sel.name_filter, self.cfg.max_nodes)
         if not sel.nodes:
@@ -551,15 +595,16 @@ class SpeedBot:
         if not self.cfg.schedule_times:
             return None
         now = now or datetime.now(self.tz)
+        # 同一 tzinfo 的 aware datetime 比较和相减都按墙上时间、忽略 UTC 偏移，全部换成 UTC，夏令时切换日也准确
+        now_utc = now.astimezone(timezone.utc)
         candidates = []
         for days in (0, 1):
             day = (now + timedelta(days=days)).date()
             for h, m in self.cfg.schedule_times:
-                t = datetime(day.year, day.month, day.day, h, m, tzinfo=self.tz)
-                if t > now:
+                t = datetime(day.year, day.month, day.day, h, m, tzinfo=self.tz).astimezone(timezone.utc)
+                if t > now_utc:
                     candidates.append(t)
-        # 同一 tzinfo 的 aware datetime 相减会忽略 UTC 偏移，换成 UTC 再算，夏令时切换日也准确
-        return (min(candidates).astimezone(timezone.utc) - now.astimezone(timezone.utc)).total_seconds()
+        return (min(candidates) - now_utc).total_seconds()
 
     def _auto_chats(self) -> list[int]:
         return sorted(self.cfg.auto_chat_ids or self.cfg.allowed_chat_ids)
@@ -723,6 +768,7 @@ class SpeedBot:
         idx = int(arg) if arg.isdigit() else -1
         if kind == "x":
             self.selections.pop(sid, None)
+            sel.page = "terminated"
             await q.answer()
             await self._edit(sel.status, f"❌ 任务 <b>{esc(sel.label)}</b> 已终止。")
             return
@@ -734,7 +780,7 @@ class SpeedBot:
             if not await self._prepare(sel):
                 self.selections.pop(sid, None)
                 return
-            if self.selections.get(sid) is not sel:  # 加载期间被终止
+            if sel.page == "terminated":  # 加载期间被终止（过期清理不算终止，菜单继续）
                 return
             await self._next_step(sid, sel, context.application)
             return
@@ -760,12 +806,20 @@ class SpeedBot:
             sel.page = "sort"
         else:
             sel.sort = SORTS[idx][1]
-        submit = self._advance(sid, sel)
-        await q.answer()
-        if submit:
+        if self._advance(sid, sel):
+            # 忙碌检查到 _submit 预占名额之间不能 await，否则应答期间别人占满名额、菜单却已移除
+            context.application.create_task(self._answer_quietly(q))
             await self._submit(sel, context.application)
         else:
+            await q.answer()
             await self._render_menu(sid, sel)
+
+    @staticmethod
+    async def _answer_quietly(q) -> None:
+        try:
+            await q.answer()
+        except TelegramError as e:
+            log.debug("应答按钮失败：%s", e)
 
     # ------------------------------------------------------------ 提交与跟踪
 
@@ -789,6 +843,13 @@ class SpeedBot:
         for c in chats:
             self.running.setdefault(c, set()).add(pending)
         try:
+            # 菜单可能已打开好几分钟：提交前再确认一次群成员身份（在预占之后检查，期间名额不会被抢）
+            if member and not wait:
+                async def notify(text: str, **kw) -> None:
+                    await self._edit(status, text)
+                if not await self._check_member(user, sel.chat_id, sel.chat_title, application.bot, notify):
+                    self.quota.refund(user.id)
+                    return
             await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
             task_name = f"{sel.label} · 测速 · {user.full_name if user else '自动测速'}"[:128]
             try:
