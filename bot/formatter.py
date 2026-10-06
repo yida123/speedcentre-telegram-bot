@@ -179,3 +179,21 @@ def format_stats(entries: list[dict]) -> str:
     if best_name:
         s += f"，最快：{esc(best_name)}（{fmt_speed(best_speed)}）"
     return s
+
+
+def node_speed(entry: dict) -> float:
+    """单个节点的平均速度（字节/秒），没有测出速度时为 0。"""
+    value = (summarize_entry(entry).get("SPEED_AVERAGE") or {}).get("Value")
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def fmt_duration(seconds: float) -> str:
+    """把秒数写成“1 小时 5 分钟”“45 秒”这样的形式。"""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds} 秒"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    parts = [f"{days} 天" if days else "", f"{hours} 小时" if hours else "", f"{minutes} 分钟" if minutes else ""]
+    return " ".join(p for p in parts if p) or "0 秒"

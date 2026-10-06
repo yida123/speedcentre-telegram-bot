@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from telegram.ext import ApplicationHandlerStop
 
-from bot.config import Config, load_subscriptions, parse_times
+from bot.config import Config, load_subscriptions
 from bot.formatter import build_plan
 from bot.main import SpeedBot, TaskView
 from bot.quota import DailyQuota
@@ -32,9 +32,13 @@ class FakeUser:
         return f"<a>u{self.id}</a>"
 
 
+_ids = iter(range(1000, 10 ** 9))
+
+
 class FakeMessage:
     def __init__(self, chat_id=-100, text=""):
         self.chat_id, self.text, self.caption = chat_id, text, None
+        self.message_id = next(_ids)
         self.edits, self.replies, self.photos, self.photo_markups = [], [], [], []
         self.deleted = False
         self.reply_to_message = None
@@ -45,11 +49,14 @@ class FakeMessage:
     async def reply_text(self, text, **kw):
         m = FakeMessage(self.chat_id)
         self.replies.append((text, kw.get("reply_markup"), m))
+        self.last_reply_kw = kw
         return m
 
     async def reply_photo(self, photo, caption=None, **kw):
+        assert kw.get("allow_sending_without_reply") is True  # 被回复的消息可能已被定时删除
         self.photos.append(caption)
         self.photo_markups.append(kw.get("reply_markup"))
+        return FakeMessage(self.chat_id)
 
     async def delete(self):
         self.deleted = True
@@ -76,8 +83,8 @@ class FakeAPI:
             {"client_id": "PRIV", "display_name": "私有", "is_online": True, "allow_public_access": False},
         ]
 
-    async def submit_task(self, name, nodes, matrices, slave_id=None):
-        self.submitted, self.slave_id = (name, nodes, matrices), slave_id
+    async def submit_task(self, name, nodes, matrices, configs, slave_id=None):
+        self.submitted, self.slave_id, self.configs = (name, nodes, matrices), slave_id, configs
         self.calls.append(name)
         return {"task_id": TASK_ID, "status": "pending"}
 
@@ -91,16 +98,33 @@ class FakeAPI:
         self.sort = sort
         return b"img"
 
+    async def cancel_task(self, task_id):
+        self.canceled = getattr(self, "canceled", []) + [task_id]
+
     async def create_share(self, task_id, title, hide_private_info=True):
         self.shared = (task_id, title, hide_private_info)
-        return {"uuid": "share-1"}
+        return {"uuid": "5e1f0c2a-0000-4000-8000-00000000abcd"}
 
 
 class FakeBot:
     username = "speedbot"
+    id = 777
 
     def __init__(self, members=(1, 2)):
         self.sent, self.members = [], set(members)
+        self.pins, self.unpins, self.commands = [], [], {}
+
+    async def pin_chat_message(self, chat_id, message_id, **kw):
+        self.pins.append((chat_id, message_id))
+
+    async def unpin_chat_message(self, chat_id, message_id=None, **kw):
+        self.unpins.append((chat_id, message_id))
+
+    async def set_my_commands(self, commands, scope=None, **kw):
+        self.commands[getattr(scope, "chat_id", None)] = [c.command for c in commands]
+
+    async def delete_my_commands(self, scope=None, **kw):
+        self.commands.pop(getattr(scope, "chat_id", None), None)
 
     async def send_message(self, chat_id, text, **kw):
         m = FakeMessage(chat_id)
@@ -142,6 +166,7 @@ def make_bot(tmp_path, **kw):
     kw.setdefault("subscriptions", SUBS)
     kw.setdefault("allowed_chat_ids", {-100})
     kw.setdefault("admin_user_ids", {ADMIN})
+    kw.setdefault("daily_limit", 3)  # 次数限制相关的测试按每天 3 次来验证；Config 默认不限
     bot = SpeedBot(Config(bot_token="t", api_key="k", data_dir=str(tmp_path), **kw))
     bot.api = FakeAPI()
     return bot
@@ -203,7 +228,8 @@ def test_admin_full_flow_pick_sub_backend_sort(tmp_path):
         assert bot.api.sort == "avg_speed_desc"
         caption = status.photos[0]
         assert "✅ 任务 <b>3399</b> 已完成" in caption and "<a>u9</a>" in caption and "今日剩余" not in caption
-        assert status.photo_markups[0].inline_keyboard[0][0].url == "https://scp.example/share/share-1"
+        assert status.photo_markups[0].inline_keyboard[0][0].url == \
+            "https://scp.example/share/" + "5e1f0c2a-0000-4000-8000-00000000abcd".replace("-", "")
         assert bot.quota.used(ADMIN) == 0 and bot.running[-100] == set()
 
     asyncio.run(run())
@@ -362,7 +388,7 @@ def test_group_sub_link_deleted(tmp_path):
 # ---------------------------------------------------------------- 每日自动测速与手动触发
 
 def test_seconds_until_next_run(tmp_path):
-    bot = make_bot(tmp_path, schedule_times=[(9, 0), (21, 0)])
+    bot = make_bot(tmp_path, schedule_spec="09:00,21:00")
     tz = ZoneInfo("Asia/Shanghai")
     assert bot.seconds_until_next_run(datetime(2026, 10, 6, 8, 59, tzinfo=tz)) == 60
     assert bot.seconds_until_next_run(datetime(2026, 10, 6, 9, 0, tzinfo=tz)) == 12 * 3600
@@ -410,7 +436,7 @@ def test_autotest_command(tmp_path):
 
 def test_sub_command(tmp_path):
     async def run():
-        bot = make_bot(tmp_path, schedule_times=[(9, 0)])
+        bot = make_bot(tmp_path, schedule_spec="09:00")
         upd, msg = update("/sub")
         await bot.cmd_sub(upd, FakeContext())
         text = msg.replies[-1][0]
@@ -445,9 +471,6 @@ def test_load_subscriptions_and_times(tmp_path):
     with pytest.raises(SystemExit, match="重复"):
         load_subscriptions(str(p))
     assert load_subscriptions(str(tmp_path / "missing.yaml")) == []  # 没有本机场订阅时只提供群友测速
-    assert parse_times("21:00, 9:05,21:00") == [(9, 5), (21, 0)]
-    with pytest.raises(SystemExit, match="格式错误"):
-        parse_times("25:00")
 
 
 # ---------------------------------------------------------------- 审查发现的问题的回归测试
@@ -544,7 +567,7 @@ def test_scheduled_run_waits_for_manual_run(tmp_path):
 
 
 def test_schedule_across_dst_change(tmp_path):
-    bot = make_bot(tmp_path, schedule_times=[(9, 0)], timezone="America/New_York")
+    bot = make_bot(tmp_path, schedule_spec="09:00", timezone="America/New_York")
     tz = ZoneInfo("America/New_York")
     # 2026-11-01 凌晨 2 点夏令时结束：00:30 EDT 到 09:00 EST 实际经过 9.5 小时
     assert bot.seconds_until_next_run(datetime(2026, 11, 1, 0, 30, tzinfo=tz)) == 9.5 * 3600
@@ -556,9 +579,14 @@ def test_schedule_defaults_to_nine(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("TG_BOT_TOKEN", "t")
     monkeypatch.setenv("SCP_API_KEY", "k")
-    assert Config.from_env().schedule_times == [(9, 0)]
+    assert Config.from_env().schedule_spec == "09:00"
     monkeypatch.setenv("SCHEDULE_TIMES", "")
-    assert Config.from_env().schedule_times == []
+    assert Config.from_env().schedule_spec == ""
+    monkeypatch.setenv("SCHEDULE_TIMES", "0 */6 * * *")
+    assert Config.from_env().schedule_spec == "0 */6 * * *"
+    monkeypatch.setenv("SCHEDULE_TIMES", "* * * * *")
+    with pytest.raises(SystemExit, match="至少间隔"):
+        Config.from_env()
 
 
 class YieldingQuery(FakeQuery):
@@ -792,7 +820,7 @@ def test_losing_final_click_keeps_its_menu(tmp_path):
 
 def test_schedule_in_repeated_fall_back_hour(tmp_path):
     from datetime import timezone as dt_tz
-    bot = make_bot(tmp_path, schedule_times=[(1, 30)], timezone="America/New_York")
+    bot = make_bot(tmp_path, schedule_spec="01:30", timezone="America/New_York")
     # 01:30 EDT 的那次已经跑过，现在是第二个 01:10（EST）：下一次应在明天 01:30，而不是负数立刻重跑
     now = datetime(2026, 11, 1, 6, 10, tzinfo=dt_tz.utc).astimezone(ZoneInfo("America/New_York"))
     assert bot.seconds_until_next_run(now) > 20 * 3600
@@ -898,3 +926,312 @@ def test_refund_after_midnight_does_not_touch_new_day(tmp_path):
     assert q.used(1) == 1  # 不能从新一天的次数里退
     q.refund(1, q.date)
     assert q.used(1) == 0
+
+
+# ---------------------------------------------------------------- 始终发送完整的测速配置
+
+CONFIG_KEYS = {"Scripts", "dnsServers", "downloadDuration", "downloadThreading", "downloadURL", "pingAddress",
+               "pingAverageOver", "stunURL", "taskRetry", "tracerouteMaxHops", "tracerouteProbesPerHop",
+               "tracerouteTimeout"}
+
+
+def test_every_submission_sends_full_configs(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        await member_submit(bot, ctx)  # 群员私聊
+        assert set(bot.api.configs) == CONFIG_KEYS
+        assert bot.api.configs["downloadDuration"] > 0 and bot.api.configs["downloadThreading"] > 0
+        assert bot.api.configs["downloadURL"].startswith("https://")
+        await ctx.run_tasks()
+
+        bot.api.configs = None
+        await bot.run_auto(FakeApp(), [-100], "🕘")  # 自动测速
+        assert set(bot.api.configs) == CONFIG_KEYS
+
+    asyncio.run(run())
+
+
+def test_task_configs_from_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    monkeypatch.setenv("SPEED_DURATION", "12")
+    monkeypatch.setenv("SPEED_THREADS", "")  # 空值使用默认
+    monkeypatch.setenv("DNS_SERVERS", "1.1.1.1, 8.8.8.8")
+    configs = Config.from_env().task_configs()
+    assert configs["downloadDuration"] == 12 and configs["downloadThreading"] == Config.speed_threads
+    assert configs["dnsServers"] == ["1.1.1.1", "8.8.8.8"]
+
+
+def test_api_client_always_sends_configs():
+    import httpx
+    from bot.api import SCPClient
+
+    seen = {}
+
+    def handler(req):
+        import json as _json
+        seen.update(_json.loads(req.content))
+        return httpx.Response(201, json={"code": 0, "message": "ok", "data": {"task_id": "t"}})
+
+    async def run():
+        c = SCPClient("k", "https://x")
+        c._client = httpx.AsyncClient(base_url="https://x", transport=httpx.MockTransport(handler))
+        await c.submit_task("n", [], [], {"downloadDuration": 8})
+        assert seen["configs"] == {"downloadDuration": 8}
+
+    asyncio.run(run())
+
+
+def test_default_configs_match_official_example():
+    # https://scx.gitbook.io/sc/scp-docs/speedcentre+-copilot-shi-yong 中的 Koipy 对接示例
+    c = Config(bot_token="t", api_key="k").task_configs()
+    assert c["downloadDuration"] == 8 and c["downloadThreading"] == 4 and c["pingAverageOver"] == 3
+    assert c["taskRetry"] == 3 and c["dnsServers"] == [] and c["Scripts"] == []
+    assert c["downloadURL"] == ("https://dl.google.com/dl/android/studio/install/3.4.1.0/"
+                                "android-studio-ide-183.5522156-windows.exe")
+    assert c["pingAddress"] == "https://cp.cloudflare.com/generate_204"
+    assert c["stunURL"] == "udp://stunserver2025.stunprotocol.org:3478"
+
+
+def test_no_share_link_by_default_but_can_be_enabled(tmp_path, monkeypatch):
+    from bot.config import WEB_SHARE_URL
+
+    async def share(task_id, title, hide_private_info=True):
+        return {"uuid": "bddb13a7-1121-4189-820c-1de955d75f01"}
+
+    async def run():
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1])  # 默认：不创建分享、不附链接
+        bot.api.create_share = share
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        assert app.bot.sent[0][3].photo_markups[0] is None
+
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1], share_url=WEB_SHARE_URL)
+        bot.api.create_share = share
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        button = app.bot.sent[0][3].photo_markups[0].inline_keyboard[0][0]
+        assert button.text == "📊 查看详情"
+        assert button.url == "https://web.speedcentre.plus/share?share_id=bddb13a711214189820c1de955d75f01"
+
+    asyncio.run(run())
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    for value, expected in (("", ""), ("off", ""), (WEB_SHARE_URL, WEB_SHARE_URL)):
+        monkeypatch.setenv("SCP_SHARE_URL", value)
+        assert Config.from_env().share_url == expected
+
+def test_unlimited_by_default(tmp_path, monkeypatch):
+    assert Config(bot_token="t", api_key="k").daily_limit == 0
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    monkeypatch.delenv("DAILY_LIMIT", raising=False)
+    assert Config.from_env().daily_limit == 0
+    monkeypatch.setenv("DAILY_LIMIT", "")
+    assert Config.from_env().daily_limit == 0
+
+    async def run():
+        bot = make_bot(tmp_path, daily_limit=0, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        for _ in range(5):  # 想测就测
+            bot.api.submitted = None
+            await member_submit(bot, ctx)
+            assert bot.api.submitted
+            await ctx.run_tasks()
+        assert "今日剩余" not in ctx.bot.sent[-1][1]
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        assert "不受限制" in msg.replies[-1][0]
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 群里除测速结果外的消息定时删除
+
+def test_group_command_and_reply_are_deleted_dm_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        reply = msg.replies[-1][2]
+        assert not msg.deleted and not reply.deleted
+        await asyncio.sleep(0.05)
+        assert msg.deleted and reply.deleted  # 用户的命令和 bot 的回复都删掉
+
+        dm = await member_submit(bot, FakeContext(), text="你好")  # 私聊消息不删
+        await asyncio.sleep(0.05)
+        assert not dm.deleted and not dm.replies[-1][2].deleted
+
+    asyncio.run(run())
+
+
+def test_progress_deleted_after_result_result_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, backend_select=False, sort_select=False)
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        progress = app.bot.sent[0][3]
+        assert progress.photos  # 结果图已作为回复发出（结果图本身不会被安排删除）
+        await asyncio.sleep(0.05)
+        assert progress.deleted  # 进度消息在结果发出后删除
+
+        ctx = FakeContext()
+        await member_submit(bot, ctx)  # 群员私聊提交：私聊里的“已提交”保留，群里的进度消息结果发出后删除
+        group_msg = ctx.bot.sent[-1][3]
+        await ctx.run_tasks()
+        await asyncio.sleep(0.05)
+        assert group_msg.photos and group_msg.deleted
+
+    asyncio.run(run())
+
+
+def test_terminated_and_failed_menus_are_deleted(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)  # 管理员在群里打开菜单
+        status = msg.replies[-1][2]
+        sid = next(iter(bot.selections))
+        await asyncio.sleep(0.05)
+        assert not status.deleted  # 还在使用中的菜单不删
+        await click(bot, f"sel:{sid}:x", ctx=ctx)
+        await asyncio.sleep(0.05)
+        assert status.deleted
+
+    asyncio.run(run())
+
+
+def test_auto_delete_can_be_disabled(tmp_path, monkeypatch):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0)
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        await asyncio.sleep(0.05)
+        assert not msg.deleted and not msg.replies[-1][2].deleted
+
+    asyncio.run(run())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    for value, expected in (("", 10.0), ("0", 0.0), ("30", 30.0)):
+        monkeypatch.setenv("AUTO_DELETE_SECONDS", value)
+        assert Config.from_env().auto_delete_seconds == expected
+
+
+
+# ---------------------------------------------------------------- 自动删除专项审查的回归测试
+
+def test_abandoned_and_expired_menus_are_cleaned_up(tmp_path, monkeypatch):
+    import bot.main as main_mod
+    monkeypatch.setattr(main_mod, "SELECTION_TTL", 0.05)
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)  # 没人点的菜单，之后也没人再发 /speed
+        status = msg.replies[-1][2]
+        await asyncio.sleep(1.3)
+        assert status.deleted and not bot.selections
+
+        msg, ctx = await speed(bot)  # 过期后才被点击的菜单
+        status = msg.replies[-1][2]
+        sid = next(iter(bot.selections))
+        bot.selections[sid].created -= 10
+        q = await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        await asyncio.sleep(0.2)
+        assert "过期" in q.answers[0] and status.deleted
+
+    asyncio.run(run())
+
+
+def test_purge_skips_loading_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+        msg, ctx = await speed(bot)
+        sid = next(iter(bot.selections))
+        sel = bot.selections[sid]
+        sel.page, sel.created = "loading", sel.created - 10_000
+        bot._purge_selections()
+        await asyncio.sleep(0.2)
+        assert sid in bot.selections and not sel.status.deleted
+
+    asyncio.run(run())
+
+
+def test_result_unavailable_notice_is_deleted(tmp_path):
+    from bot.api import APIError
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01)
+
+        async def fail(*a, **kw):
+            raise APIError("任务不存在")
+
+        bot.api.get_result = bot.api.export_image = fail
+        upd, msg = update(f"/result {TASK_ID}")
+        await bot.cmd_result(upd, FakeContext([TASK_ID]))
+        notice = msg.replies[-1][2]
+        assert "无法获取结果" in msg.replies[-1][0]
+        await asyncio.sleep(0.05)
+        assert notice.deleted
+
+    asyncio.run(run())
+
+
+def test_progress_kept_when_result_could_not_be_posted(tmp_path):
+    from telegram.error import TimedOut
+
+    class FailingPhoto(FakeMessage):
+        async def reply_photo(self, *a, **kw):
+            raise TimedOut()
+
+    class Bot2(FakeBot):
+        async def send_message(self, chat_id, text, **kw):
+            m = FailingPhoto(chat_id)
+            self.sent.append((chat_id, text, kw.get("reply_markup"), m))
+            return m
+
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, subscriptions=SUBS[:1])
+        app = FakeApp()
+        app.bot = Bot2()
+        await bot.run_auto(app, [-100], "🕘")
+        await asyncio.sleep(0.05)
+        progress = app.bot.sent[0][3]
+        assert "已完成" in progress.edits[-1][0] and not progress.deleted  # 结果没发出去：保留摘要和任务 ID
+
+    asyncio.run(run())
+
+
+def test_timeout_notice_is_kept(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, auto_delete_seconds=0.01, task_timeout=0, subscriptions=SUBS[:1])
+
+        async def running(task_id):
+            return {"status": "running", "completed_nodes": 0, "node_count": 1}
+
+        bot.api.get_task = running
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        await asyncio.sleep(0.05)
+        progress = app.bot.sent[0][3]
+        assert "等待超时" in progress.edits[-1][0] and not progress.deleted
+
+    asyncio.run(run())
+
+
+def test_pending_deletions_flushed_on_stop_and_replies_tolerate_deleted_command(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)  # 默认 10 秒
+        upd, msg = update("/sub")
+        await bot.cmd_sub(upd, FakeContext())
+        assert msg.last_reply_kw.get("allow_sending_without_reply") is True
+        reply = msg.replies[-1][2]
+        assert not msg.deleted and not reply.deleted
+        await bot.flush_expiring()  # 关闭时立即删除还没到时间的消息
+        assert msg.deleted and reply.deleted and not bot._timers
+
+    asyncio.run(run())

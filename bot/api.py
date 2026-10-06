@@ -88,12 +88,11 @@ class SCPClient:
         name: str,
         nodes: list[dict],
         matrices: list[dict],
-        configs: dict | None = None,
+        configs: dict,
         slave_id: str | None = None,
     ) -> dict:
-        payload: dict[str, Any] = {"name": name[:128], "nodes": nodes, "matrices": matrices}
-        if configs:
-            payload["configs"] = configs
+        # 文档把 configs 标为可选，但当前后端在省略 configs 时会异常断开连接，所以必须始终带上完整配置
+        payload: dict[str, Any] = {"name": name[:128], "nodes": nodes, "matrices": matrices, "configs": configs}
         if slave_id:
             payload["slave_id"] = slave_id
         return await self._request("POST", "/api/v1/tasks", json=payload)
