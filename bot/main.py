@@ -86,6 +86,7 @@ class Selection:
     backends: list[dict] = field(default_factory=list)  # 可选后端快照
     backend_page: int = 0
     sort: str | None = None  # None 表示未选择（使用平均速度降序）
+    warnings: str = ""  # 部分订阅失败或被跳过时的提示
     page: str = "subs"
     created: float = field(default_factory=time.monotonic)
 
@@ -136,6 +137,7 @@ class SpeedBot:
         self._backends: tuple[float, list[dict]] | None = None
         self._auto_lock = asyncio.Lock()
         self._loading: set[int] = set()  # 正在解析订阅的群成员，每人同时只能有一个
+        self._parsing: dict[int, int] = {}  # 群成员仍在后台线程里跑的解析数（超时后线程不会停，跑完才算结束）
 
     # ------------------------------------------------------------ 权限与次数
 
@@ -492,7 +494,7 @@ class SpeedBot:
             return
 
         # 每人同时只能解析一个订阅（检查和登记之间没有 await，并发消息也只有一个能通过）
-        if user.id in self._loading:
+        if user.id in self._loading or self._parsing.get(user.id):
             await msg.reply_text("你的上一个订阅还在解析中，请等它完成后再发送。")
             return
         self._loading.add(user.id)
@@ -505,6 +507,22 @@ class SpeedBot:
                 await self._next_step(secrets.token_hex(4), sel, context.application)
         finally:
             self._loading.discard(user.id)
+
+    def _track_parse(self, user_id: int, future) -> None:
+        """记录群成员的后台解析，线程真正结束后才释放（等待被超时取消时线程仍在跑）。"""
+        loop = asyncio.get_running_loop()
+        self._parsing[user_id] = self._parsing.get(user_id, 0) + 1
+
+        def done(_):
+            def release():
+                left = self._parsing.get(user_id, 1) - 1
+                if left > 0:
+                    self._parsing[user_id] = left
+                else:
+                    self._parsing.pop(user_id, None)
+            loop.call_soon_threadsafe(release)
+
+        future.add_done_callback(done)
 
     async def _load_nodes(self, sel: Selection) -> str | None:
         """拉取订阅、解析节点，并确定可选后端。成功返回 None，失败返回要显示的错误信息。"""
@@ -524,28 +542,40 @@ class SpeedBot:
         # 本机场订阅（自动测速、管理员）用默认线程池，群成员的订阅用专用小线程池，互不影响
         trusted = sel.owner is None or self.is_admin(sel.owner.id)
         executor = None if trusted else PARSE_POOL
+        on_parse = None if trusted else (lambda f: self._track_parse(sel.owner.id, f))
 
         async def fetch_all() -> None:
             for url in subs:
                 if len(proxies) >= MAX_PROXIES:
                     break
                 try:
-                    got = await fetch_subscription(url, executor=executor)
+                    got = await fetch_subscription(url, executor=executor, on_parse=on_parse)
                     if not got:
                         errors.append("订阅中没有找到节点")
                     proxies.extend(got[:MAX_PROXIES - len(proxies)])
                 except SubscriptionError as e:
                     errors.append(str(e))
+                except Exception:  # 无效链接（如 https://[abc/sub）等意外错误：跳过这个链接，其余照常
+                    log.warning("拉取订阅出错", exc_info=True)  # 不记录链接本身，里面可能有 token
+                    errors.append("获取订阅失败：链接无效或内容无法解析")
 
         try:
             await asyncio.wait_for(fetch_all(), SUB_FETCH_TIMEOUT)  # 所有订阅共用一个总超时
         except asyncio.TimeoutError:  # Python 3.10 中与内置 TimeoutError 不是同一个类
-            errors.append("获取订阅超时")
-        # 节点很多时转换也比较耗时，放到线程里
-        sel.nodes, sel.skipped = await asyncio.to_thread(to_api_nodes, proxies, sel.name_filter, self.cfg.max_nodes)
+            errors.append("获取订阅超时，未完成的订阅已跳过")
+        try:
+            # 节点很多时转换也比较耗时，放到线程里
+            sel.nodes, sel.skipped = await asyncio.to_thread(
+                to_api_nodes, proxies, sel.name_filter, self.cfg.max_nodes)
+        except Exception:
+            log.warning("转换节点出错", exc_info=True)
+            sel.nodes, sel.skipped = [], len(proxies)
+            errors.append("节点内容无法解析")
         if not sel.nodes:
             detail = "；".join(dict.fromkeys(errors)) or "没有符合条件的节点"
             return f"❌ 任务 <b>{esc(sel.label)}</b> 没有可测试的节点：{esc(detail)}"
+        # 部分成功时也告诉用户哪些订阅被跳过了
+        sel.warnings = "；".join(dict.fromkeys(errors))
 
         sel.backends = await self._selectable_backends()
         chosen = None
@@ -748,6 +778,8 @@ class SpeedBot:
                     f"订阅名：<b>{esc(sel.label)}</b>\n选中后端：<b>{esc(sel.slave or '自动选择')}</b>")
             buttons = [btn(label, f"o:{n}") for n, (label, _) in enumerate(SORTS)]
             rows += [buttons[:1], buttons[1:2], buttons[2:]]
+        if sel.warnings and sel.page in ("backends", "sort"):
+            text += f"\n⚠️ {esc(sel.warnings)}"
         if sel.chat_id != sel.status.chat_id and sel.page != "subs":
             text += f"\n结果将发送到群「{esc(sel.chat_title)}」"
         rows.append([btn("❌ 终止操作", "x")])
@@ -876,6 +908,8 @@ class SpeedBot:
             info += f" · 过滤 <code>{esc(sel.name_filter)}</code>"
         if remaining is not None:
             info += f" · 今日剩余 {remaining} 次"
+        if sel.warnings:
+            info += f"\n⚠️ {esc(sel.warnings)}"
         info += f"\nID <code>{task_id}</code>"
         sort = "avg_speed_desc" if sel.sort is None else (sel.sort or None)
         view = TaskView(task_id, sel.label, info, sel.slave_name or sel.slave or "自动选择", sort)

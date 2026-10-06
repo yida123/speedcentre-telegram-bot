@@ -796,3 +796,92 @@ def test_schedule_in_repeated_fall_back_hour(tmp_path):
     # 01:30 EDT 的那次已经跑过，现在是第二个 01:10（EST）：下一次应在明天 01:30，而不是负数立刻重跑
     now = datetime(2026, 11, 1, 6, 10, tzinfo=dt_tz.utc).astimezone(ZoneInfo("America/New_York"))
     assert bot.seconds_until_next_run(now) > 20 * 3600
+
+
+# ---------------------------------------------------------------- 第三轮审查发现的问题的回归测试
+
+def test_deeply_nested_yaml_is_rejected_without_crash():
+    from bot.subscription import parse_content
+    for text in ("x: " + "[" * 100_000 + "]" * 100_000,      # 流写法
+                 "x:\n" + "- " * 100_000 + "a",                # 块写法，没有括号
+                 "proxies:\n  - {name: a, type: ss, server: s, port: 1, d: 2020-02-30}"):  # 非法日期
+        assert parse_content(text) == []
+
+
+def test_anchor_chain_depth_and_string_amplification_are_skipped():
+    import time as _time
+    from bot.subscription import parse_content, to_api_nodes
+    chain = ["c0: &c0 x"] + [f"c{i}: &c{i} [[[[[[[[[[*c{i - 1}]]]]]]]]]]" for i in range(1, 41)]
+    chain.append("proxies:\n  - {name: deep, type: ss, server: s, port: 1, evil: *c40}")
+    assert to_api_nodes(parse_content("\n".join(chain))) == ([], 1)
+
+    big = "A" * 1_000_000
+    keys = ", ".join(f"k{i}: *a" for i in range(500))
+    text = f"pad: &a {big}\nproxies:\n  - {{name: amp, type: ss, server: s, port: 1, {keys}}}"
+    started = _time.monotonic()
+    assert to_api_nodes(parse_content(text)) == ([], 1) and _time.monotonic() - started < 10
+
+
+def test_date_names_are_kept():
+    from bot.subscription import parse_content, to_api_nodes
+    nodes, skipped = to_api_nodes(parse_content(
+        "proxies:\n  - {name: 2024-12-31, type: trojan, server: a.example.com, port: 443, password: x}"))
+    assert [n["Name"] for n in nodes] == ["2024-12-31"] and skipped == 0
+
+
+def test_invalid_link_does_not_lose_other_nodes(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        dm = await member_submit(bot, FakeContext(), text="https://[abc/sub trojan://pw@x.com:443#ok")
+        text = dm.replies[-1][2].edits[-1][0]
+        assert "选择测速后端" in text and "节点 1 个" in text and "链接无效" in text
+
+    asyncio.run(run())
+
+
+def test_warnings_shown_when_some_subscriptions_skipped(tmp_path, monkeypatch):
+    import bot.main as main_mod
+
+    async def fetch(url, **kw):
+        return [{"name": url[-1], "type": "trojan", "server": "s", "port": 1}]
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        await member_submit(bot, ctx, text=" ".join(f"https://a.example/s{i}" for i in range(7)))
+        group_text = ctx.bot.sent[-1][1]
+        assert "节点 5 个" in group_text and "其余已忽略" in group_text
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_member_stays_blocked_until_abandoned_parse_finishes(tmp_path, monkeypatch):
+    import concurrent.futures
+    import bot.main as main_mod
+
+    pending = concurrent.futures.Future()
+
+    async def fetch(url, on_parse=None, **kw):
+        if on_parse:
+            on_parse(pending)  # 模拟仍在后台线程里跑的解析
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+    monkeypatch.setattr(main_mod, "SUB_FETCH_TIMEOUT", 0.02)
+
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        await member_submit(bot, ctx, text="https://slow.example/a")  # 等待超时返回，但解析线程还在跑
+        dm = await member_submit(bot, ctx, text="https://slow.example/b")
+        assert "还在解析中" in dm.replies[-1][0]
+        pending.set_result([])  # 解析线程结束
+        await asyncio.sleep(0)
+        assert not bot._parsing
+        dm = await member_submit(bot, ctx, text="https://slow.example/c")
+        assert "还在解析中" not in dm.replies[-1][0]
+
+    asyncio.run(run())

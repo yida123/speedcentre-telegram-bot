@@ -4,12 +4,14 @@ API 的 Node.Payload 是单个节点的 Clash YAML，所以这里统一先转成
 """
 import asyncio
 import base64
+import datetime
 import ipaddress
 import json
 import re
 import socket
 import urllib.request
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -276,6 +278,13 @@ MAX_PROXIES = 50_000
 MAX_PROXY_ITEMS = 2_000
 # 一次转换中所有节点合计最多检查的元素数，防止大量“刚好不超限”的节点累计耗尽 CPU
 MAX_TOTAL_ITEMS = 2_000_000
+# 单个节点配置展开后的字符串总长度上限（同一个字符串被别名引用多次时重复计算）
+MAX_PROXY_BYTES = 64 * 1024
+# YAML 最大嵌套层数。正常的 Clash 配置不超过十层；libyaml 组装节点时在 C 里逐层递归、没有深度限制，
+# 嵌套几万层就会栈溢出让整个进程崩溃，纯 Python 版本则会抛出 RecursionError
+MAX_YAML_DEPTH = 32
+_YAML_OPEN = (yaml.SequenceStartEvent, yaml.MappingStartEvent)
+_YAML_CLOSE = (yaml.SequenceEndEvent, yaml.MappingEndEvent)
 # libyaml 版本的加载器快约 10 倍（PyYAML 的 wheel 自带），没有时退回纯 Python 版本
 _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 # 解析群成员订阅专用的小线程池：超时只能取消等待、停不掉已经在跑的解析线程，
@@ -283,21 +292,40 @@ _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 PARSE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sub-parse")
 
 
-def item_count(obj, limit: int = MAX_PROXY_ITEMS) -> int | None:
-    """按展开后的元素数（共享引用重复计数）统计结构大小；超过 limit 时返回 None。
-    遇到别名炸弹或循环引用会在 limit 处尽早停止。"""
-    count, stack = 0, [obj]
+def item_count(obj, limit: int = MAX_PROXY_ITEMS, max_bytes: int = MAX_PROXY_BYTES,
+               max_depth: int = MAX_YAML_DEPTH) -> int | None:
+    """按展开后的大小（共享引用重复计数）统计结构的元素数；元素数、字符串总长度或嵌套层数超限时返回 None。
+    遇到别名炸弹、字符串别名放大、锚点链造成的深层嵌套或循环引用时都会尽早停止，
+    保证之后的 yaml.safe_dump 和 str() 不会展开出海量数据或递归超限。"""
+    count, size, stack = 0, 0, [(obj, 0)]
     while stack:
-        cur = stack.pop()
+        cur, depth = stack.pop()
         count += 1
-        if count > limit:
+        if count > limit or depth > max_depth:
             return None
-        if isinstance(cur, dict):
-            stack.extend(cur.keys())
-            stack.extend(cur.values())
+        if isinstance(cur, (str, bytes)):
+            size += len(cur)
+            if size > max_bytes:
+                return None
+        elif isinstance(cur, dict):
+            stack.extend((x, depth + 1) for x in (*cur.keys(), *cur.values()))
         elif isinstance(cur, (list, tuple)):
-            stack.extend(cur)
+            stack.extend((x, depth + 1) for x in cur)
     return count
+
+
+def _yaml_too_deep(text: str, limit: int = MAX_YAML_DEPTH) -> bool:
+    """组装节点之前，先用事件流（libyaml 和纯 Python 的解析器都是循环实现，不递归）检查嵌套层数。
+    块写法（- - - …）和流写法（[[[…]]]）都会产生同样的事件，都能覆盖。"""
+    depth = 0
+    for ev in yaml.parse(text, Loader=_YAML_LOADER):
+        if isinstance(ev, _YAML_OPEN):
+            depth += 1
+            if depth > limit:
+                return True
+        elif isinstance(ev, _YAML_CLOSE):
+            depth -= 1
+    return False
 
 
 def parse_content(text: str) -> list[dict]:
@@ -306,8 +334,8 @@ def parse_content(text: str) -> list[dict]:
     if not text:
         return []
     try:
-        data = yaml.load(text, Loader=_YAML_LOADER)
-    except yaml.YAMLError:
+        data = None if _yaml_too_deep(text) else yaml.load(text, Loader=_YAML_LOADER)
+    except Exception:  # YAMLError、非法日期（ValueError）、RecursionError 等都按“不是 YAML”处理
         data = None
     if isinstance(data, dict) and isinstance(data.get("proxies"), list):
         return [p for p in data["proxies"][:MAX_PROXIES] if isinstance(p, dict)]
@@ -368,7 +396,10 @@ def _uses_proxy(url: str) -> bool:
 
 
 async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.AsyncBaseTransport | None = None,
-                             executor: Executor | None = PARSE_POOL) -> list[dict]:
+                             executor: Executor | None = PARSE_POOL,
+                             on_parse: Callable[[Future], None] | None = None) -> list[dict]:
+    """on_parse 会收到解析任务的 Future。调用方的等待被超时取消后解析线程仍会跑完，
+    调用方可以借此知道解析真正结束的时间（例如解析结束前不允许同一个人再提交）。"""
     """拉取订阅。每一跳（含重定向）都校验目标地址，并直接连接校验过的 IP，避免 DNS 重绑定。"""
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=transport) as client:
         for _ in range(MAX_REDIRECTS + 1):
@@ -402,8 +433,13 @@ async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.A
                         if len(body) > MAX_SUB_SIZE:
                             raise SubscriptionError("获取订阅失败：内容过大")
                     # 解析可能很耗 CPU（大订阅），放到线程池里，不阻塞事件循环；executor=None 表示默认线程池
-                    return await asyncio.get_running_loop().run_in_executor(
-                        executor, parse_content, body.decode("utf-8", errors="ignore"))
+                    text = body.decode("utf-8", errors="ignore")
+                    if executor is None:
+                        return await asyncio.get_running_loop().run_in_executor(None, parse_content, text)
+                    future = executor.submit(parse_content, text)
+                    if on_parse:
+                        on_parse(future)
+                    return await asyncio.wrap_future(future)
             except httpx.HTTPError as e:
                 raise SubscriptionError(f"获取订阅失败：{type(e).__name__}") from e
     raise SubscriptionError("获取订阅失败：重定向次数过多")
@@ -462,8 +498,10 @@ def to_api_nodes(proxies: list[dict], name_filter: str | None = None, limit: int
             continue
         budget -= size
         ptype, server, name, port = p.get("type"), p.get("server"), p.get("name"), p.get("port")
+        # YAML 1.1 会把 2024-12-31 这类不加引号的名字读成日期，Clash 把它当字符串，这里同样接受
         if (not isinstance(ptype, str) or not isinstance(server, scalar) or not server
-                or not isinstance(name, (*scalar, type(None))) or not isinstance(port, (*scalar, type(None)))
+                or not isinstance(name, (*scalar, datetime.date, type(None)))
+                or not isinstance(port, (*scalar, type(None)))
                 or ptype.lower() not in SUPPORTED_TYPES):
             skipped += 1
             continue
