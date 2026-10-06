@@ -970,11 +970,20 @@ def test_default_configs_match_official_example():
     assert c["stunURL"] == "udp://stunserver2025.stunprotocol.org:3478"
 
 
-def test_share_link_uses_web_share_page(tmp_path, monkeypatch):
+def test_no_share_link_by_default_but_can_be_enabled(tmp_path, monkeypatch):
+    from bot.config import WEB_SHARE_URL
+
+    async def share(task_id, title, hide_private_info=True):
+        return {"uuid": "bddb13a7-1121-4189-820c-1de955d75f01"}
+
     async def run():
-        bot = make_bot(tmp_path, subscriptions=SUBS[:1])  # 默认分享地址
-        async def share(task_id, title, hide_private_info=True):
-            return {"uuid": "bddb13a7-1121-4189-820c-1de955d75f01"}
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1])  # 默认：不创建分享、不附链接
+        bot.api.create_share = share
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        assert app.bot.sent[0][3].photo_markups[0] is None
+
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1], share_url=WEB_SHARE_URL)
         bot.api.create_share = share
         app = FakeApp()
         await bot.run_auto(app, [-100], "🕘")
@@ -987,10 +996,9 @@ def test_share_link_uses_web_share_page(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TG_BOT_TOKEN", "t")
     monkeypatch.setenv("SCP_API_KEY", "k")
-    for value, expected in (("", Config.share_url), ("off", ""), ("https://x/s?id={uuid}", "https://x/s?id={uuid}")):
+    for value, expected in (("", ""), ("off", ""), (WEB_SHARE_URL, WEB_SHARE_URL)):
         monkeypatch.setenv("SCP_SHARE_URL", value)
         assert Config.from_env().share_url == expected
-
 
 def test_unlimited_by_default(tmp_path, monkeypatch):
     assert Config(bot_token="t", api_key="k").daily_limit == 0

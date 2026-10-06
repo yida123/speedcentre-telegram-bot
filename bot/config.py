@@ -43,12 +43,16 @@ def load_subscriptions(path: str) -> list[tuple[str, str]]:
     return subs
 
 
+# 网页分享页地址模板：设置 SCP_SHARE_URL 为它即可在结果图下附上「查看详情」分享链接
+WEB_SHARE_URL = "https://web.speedcentre.plus/share?share_id={uuid}"
+
+
 def _share_url(value: str) -> str:
-    """空值使用默认分享页地址，off/none/false 表示不创建分享。"""
+    """默认不创建分享；填写链接模板（如 WEB_SHARE_URL）才开启，off/none/false 同样表示关闭。"""
     value = value.strip()
     if value.lower() in ("off", "none", "false", "0"):
         return ""
-    return value or Config.share_url
+    return value
 
 
 def _str_list(value: str) -> list[str]:
@@ -90,8 +94,8 @@ class Config:
     backend_select: bool = True
     sort_select: bool = True
     task_url: str = ""
-    # 分享页链接模板，{uuid} 替换为分享 ID（去掉横杠的 32 位十六进制）；off 表示不创建分享
-    share_url: str = "https://web.speedcentre.plus/share?share_id={uuid}"
+    # 分享页链接模板，{uuid} 替换为分享 ID（去掉横杠的 32 位十六进制）；默认空，不创建分享、不附链接
+    share_url: str = ""
     delete_sub_message: bool = True
     sub_link_pattern: str = ""
     poll_interval: float = 5.0
