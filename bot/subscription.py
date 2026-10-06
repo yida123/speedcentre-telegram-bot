@@ -4,11 +4,14 @@ API 的 Node.Payload 是单个节点的 Clash YAML，所以这里统一先转成
 """
 import asyncio
 import base64
+import datetime
 import ipaddress
 import json
 import re
 import socket
 import urllib.request
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -269,19 +272,75 @@ def parse_uri(uri: str) -> dict | None:
 
 # ---------------------------------------------------------------- content / subscription
 
+# 一个订阅最多保留的节点数（订阅内容来自群成员，需防止超大订阅耗尽内存）
+MAX_PROXIES = 50_000
+# 单个节点配置展开后最多包含的元素数，用于拦截 YAML 别名炸弹（极小的文本展开成海量元素）
+MAX_PROXY_ITEMS = 2_000
+# 一次转换中所有节点合计最多检查的元素数，防止大量“刚好不超限”的节点累计耗尽 CPU
+MAX_TOTAL_ITEMS = 2_000_000
+# 单个节点配置展开后的字符串总长度上限（同一个字符串被别名引用多次时重复计算）
+MAX_PROXY_BYTES = 64 * 1024
+# YAML 最大嵌套层数。正常的 Clash 配置不超过十层；libyaml 组装节点时在 C 里逐层递归、没有深度限制，
+# 嵌套几万层就会栈溢出让整个进程崩溃，纯 Python 版本则会抛出 RecursionError
+MAX_YAML_DEPTH = 32
+_YAML_OPEN = (yaml.SequenceStartEvent, yaml.MappingStartEvent)
+_YAML_CLOSE = (yaml.SequenceEndEvent, yaml.MappingEndEvent)
+# libyaml 版本的加载器快约 10 倍（PyYAML 的 wheel 自带），没有时退回纯 Python 版本
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+# 解析群成员订阅专用的小线程池：超时只能取消等待、停不掉已经在跑的解析线程，
+# 放在独立的池里，最坏情况也只占这两个线程，不会拖住其他工作（DNS 解析、管理员和自动测速）
+PARSE_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sub-parse")
+
+
+def item_count(obj, limit: int = MAX_PROXY_ITEMS, max_bytes: int = MAX_PROXY_BYTES,
+               max_depth: int = MAX_YAML_DEPTH) -> int | None:
+    """按展开后的大小（共享引用重复计数）统计结构的元素数；元素数、字符串总长度或嵌套层数超限时返回 None。
+    遇到别名炸弹、字符串别名放大、锚点链造成的深层嵌套或循环引用时都会尽早停止，
+    保证之后的 yaml.safe_dump 和 str() 不会展开出海量数据或递归超限。"""
+    count, size, stack = 0, 0, [(obj, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        count += 1
+        if count > limit or depth > max_depth:
+            return None
+        if isinstance(cur, (str, bytes)):
+            size += len(cur)
+            if size > max_bytes:
+                return None
+        elif isinstance(cur, dict):
+            stack.extend((x, depth + 1) for x in (*cur.keys(), *cur.values()))
+        elif isinstance(cur, (list, tuple)):
+            stack.extend((x, depth + 1) for x in cur)
+    return count
+
+
+def _yaml_too_deep(text: str, limit: int = MAX_YAML_DEPTH) -> bool:
+    """组装节点之前，先用事件流（libyaml 和纯 Python 的解析器都是循环实现，不递归）检查嵌套层数。
+    块写法（- - - …）和流写法（[[[…]]]）都会产生同样的事件，都能覆盖。"""
+    depth = 0
+    for ev in yaml.parse(text, Loader=_YAML_LOADER):
+        if isinstance(ev, _YAML_OPEN):
+            depth += 1
+            if depth > limit:
+                return True
+        elif isinstance(ev, _YAML_CLOSE):
+            depth -= 1
+    return False
+
+
 def parse_content(text: str) -> list[dict]:
     """解析订阅内容：Clash YAML、base64 的分享链接列表、或明文分享链接列表。"""
-    text = text.strip().lstrip("﻿")
+    text = text.strip().lstrip("\ufeff")
     if not text:
         return []
     try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError:
+        data = None if _yaml_too_deep(text) else yaml.load(text, Loader=_YAML_LOADER)
+    except Exception:  # YAMLError、非法日期（ValueError）、RecursionError 等都按“不是 YAML”处理
         data = None
     if isinstance(data, dict) and isinstance(data.get("proxies"), list):
-        return [p for p in data["proxies"] if isinstance(p, dict)]
-    if isinstance(data, list) and data and all(isinstance(p, dict) for p in data):
-        return data
+        return [p for p in data["proxies"][:MAX_PROXIES] if isinstance(p, dict)]
+    if isinstance(data, list) and data and all(isinstance(p, dict) for p in data[:MAX_PROXIES]):
+        return data[:MAX_PROXIES]
 
     if not _NODE_RE.search(text):
         try:
@@ -289,10 +348,12 @@ def parse_content(text: str) -> list[dict]:
         except Exception:
             return []
     proxies = []
-    for uri in _NODE_RE.findall(text):
-        p = parse_uri(uri)
+    for m in _NODE_RE.finditer(text):
+        p = parse_uri(m.group(0))
         if p:
             proxies.append(p)
+            if len(proxies) >= MAX_PROXIES:
+                break
     return proxies
 
 
@@ -334,7 +395,11 @@ def _uses_proxy(url: str) -> bool:
     return bool(proxies.get(u.scheme) or proxies.get("all")) and not urllib.request.proxy_bypass(u.hostname or "")
 
 
-async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.AsyncBaseTransport | None = None) -> list[dict]:
+async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.AsyncBaseTransport | None = None,
+                             executor: Executor | None = PARSE_POOL,
+                             on_parse: Callable[[Future], None] | None = None) -> list[dict]:
+    """on_parse 会收到解析任务的 Future。调用方的等待被超时取消后解析线程仍会跑完，
+    调用方可以借此知道解析真正结束的时间（例如解析结束前不允许同一个人再提交）。"""
     """拉取订阅。每一跳（含重定向）都校验目标地址，并直接连接校验过的 IP，避免 DNS 重绑定。"""
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=transport) as client:
         for _ in range(MAX_REDIRECTS + 1):
@@ -367,7 +432,14 @@ async def fetch_subscription(url: str, timeout: float = 30.0, transport: httpx.A
                         body += chunk
                         if len(body) > MAX_SUB_SIZE:
                             raise SubscriptionError("获取订阅失败：内容过大")
-                    return parse_content(body.decode("utf-8", errors="ignore"))
+                    # 解析可能很耗 CPU（大订阅），放到线程池里，不阻塞事件循环；executor=None 表示默认线程池
+                    text = body.decode("utf-8", errors="ignore")
+                    if executor is None:
+                        return await asyncio.get_running_loop().run_in_executor(None, parse_content, text)
+                    future = executor.submit(parse_content, text)
+                    if on_parse:
+                        on_parse(future)
+                    return await asyncio.wrap_future(future)
             except httpx.HTTPError as e:
                 raise SubscriptionError(f"获取订阅失败：{type(e).__name__}") from e
     raise SubscriptionError("获取订阅失败：重定向次数过多")
@@ -398,27 +470,52 @@ def contains_sensitive_link(text: str, sub_pattern: str = DEFAULT_SUB_LINK_PATTE
     return any(pattern.search(u) for u in subs)
 
 
+def match_keywords(name: str, keywords: str | None) -> bool:
+    """节点名是否包含任一关键词（用 | 分隔，不区分大小写）。不使用正则，避免恶意表达式拖垮 bot。"""
+    if not keywords:
+        return True
+    lowered = name.lower()
+    return any(k and k.lower() in lowered for k in keywords.split("|"))
+
+
 def to_api_nodes(proxies: list[dict], name_filter: str | None = None, limit: int | None = None) -> tuple[list[dict], int]:
-    """过滤并转换成 API 的 Node 列表。返回 (nodes, 被跳过的数量)。"""
-    pattern = re.compile(name_filter, re.IGNORECASE) if name_filter else None
+    """过滤并转换成 API 的 Node 列表。name_filter 为 | 分隔的关键词。返回 (nodes, 被跳过的数量)。"""
     seen: set[str] = set()
+    next_suffix: dict[str, int] = {}
     nodes, skipped = [], 0
-    for p in proxies:
-        ptype = str(p.get("type", "")).lower()
-        name = str(p.get("name") or f"{p.get('server')}:{p.get('port')}")
-        if ptype not in SUPPORTED_TYPES or not p.get("server"):
+    scalar = (str, int, float)
+    budget = MAX_TOTAL_ITEMS
+    for index, p in enumerate(proxies):
+        if (limit is not None and len(nodes) >= limit) or budget <= 0:
+            skipped += len(proxies) - index  # 已达上限，剩余节点只计数，不再检查
+            break
+        # 订阅来自群成员：先确认节点很小、关键字段是简单值，再做任何字符串转换，
+        # 否则 str() 会把 YAML 别名炸弹完整展开，卡死进程并耗尽内存
+        size = item_count(p) if isinstance(p, dict) else None
+        if size is None:
+            skipped += 1
+            budget -= MAX_PROXY_ITEMS
+            continue
+        budget -= size
+        ptype, server, name, port = p.get("type"), p.get("server"), p.get("name"), p.get("port")
+        # YAML 1.1 会把 2024-12-31 这类不加引号的名字读成日期，Clash 把它当字符串，这里同样接受
+        if (not isinstance(ptype, str) or not isinstance(server, scalar) or not server
+                or not isinstance(name, (*scalar, datetime.date, type(None)))
+                or not isinstance(port, (*scalar, type(None)))
+                or ptype.lower() not in SUPPORTED_TYPES):
             skipped += 1
             continue
-        if pattern and not pattern.search(name):
+        name = str(name) if name not in (None, "") else f"{server}:{port}"
+        if not match_keywords(name, name_filter):
             continue
-        # 节点重名会让结果难以区分，追加序号
-        base, i = name, 2
-        while name in seen:
-            name, i = f"{base} ({i})", i + 1
+        # 节点重名会让结果难以区分，追加序号（记住每个名字用到的序号，避免大量重名时反复扫描）
+        if name in seen:
+            base, i = name, next_suffix.get(name, 2)
+            while f"{base} ({i})" in seen:
+                i += 1
+            next_suffix[base] = i + 1
+            name = f"{base} ({i})"
         seen.add(name)
         p = {**p, "name": name}
         nodes.append({"Name": name, "Payload": yaml.safe_dump(p, allow_unicode=True, sort_keys=False)})
-    if limit is not None and len(nodes) > limit:
-        skipped += len(nodes) - limit
-        nodes = nodes[:limit]
     return nodes, skipped

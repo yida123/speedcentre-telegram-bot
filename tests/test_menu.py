@@ -448,3 +448,453 @@ def test_load_subscriptions_and_times(tmp_path):
     assert parse_times("21:00, 9:05,21:00") == [(9, 5), (21, 0)]
     with pytest.raises(SystemExit, match="格式错误"):
         parse_times("25:00")
+
+
+# ---------------------------------------------------------------- 审查发现的问题的回归测试
+
+def test_filter_is_keywords_not_regex(tmp_path):
+    from bot.subscription import to_api_nodes
+    proxies = [{"name": n, "type": "trojan", "server": "s", "port": 1} for n in ("香港 01", "HK-02", "日本", "a" * 40 + "!")]
+    assert [n["Name"] for n in to_api_nodes(proxies, "香港|hk")[0]] == ["香港 01", "HK-02"]
+    # 正则元字符按字面匹配：恶意表达式不会触发回溯
+    assert to_api_nodes(proxies, "(a+)+$")[0] == []
+    assert not SpeedBot._valid_filter("x" * 65) and SpeedBot._valid_filter("香港|HK")
+
+
+def test_many_duplicate_names_and_limit(tmp_path):
+    from bot.subscription import to_api_nodes
+    proxies = [{"name": "dup", "type": "trojan", "server": "s", "port": 1}] * 5000
+    nodes, skipped = to_api_nodes(proxies, None, 100)
+    assert len(nodes) == 100 and skipped == 4900 and nodes[2]["Name"] == "dup (3)"
+
+
+def test_slow_subscription_times_out(tmp_path, monkeypatch):
+    import bot.main as main_mod
+
+    async def slow_fetch(url, **kw):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", slow_fetch)
+    monkeypatch.setattr(main_mod, "SUB_FETCH_TIMEOUT", 0.05)
+
+    async def run():
+        bot = make_bot(tmp_path)
+        dm = await member_submit(bot, FakeContext(), text="https://slow.example/sub")
+        assert "获取订阅超时" in dm.replies[-1][2].edits[-1][0] and not bot.selections
+
+    asyncio.run(run())
+
+
+def test_busy_click_keeps_menu_usable(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        await member_submit(bot, ctx)
+        sid = next(iter(bot.selections))
+        bot.running[-100] = {"other-task"}
+        q = await click(bot, f"sel:{sid}:b:0", user_id=1, ctx=ctx)
+        assert "已有测速任务" in q.answers[0] and bot.selections[sid].page == "backends"
+        bot.running[-100] = set()
+        await click(bot, f"sel:{sid}:b:0", user_id=1, ctx=ctx)  # 空闲后同一个菜单仍然可用
+        assert bot.selections[sid].page == "sort" and bot.selections[sid].slave == "SHCT"
+
+    asyncio.run(run())
+
+
+def test_auto_run_submits_each_sub_once_for_all_chats(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, allowed_chat_ids={-100, -200})
+        app = FakeApp()
+        await bot.run_auto(app, [-100, -200], "🕘 每日自动测速")
+        assert len(bot.api.calls) == 2  # 两个订阅各提交一次，不按群数翻倍
+        by_chat = {}
+        for chat_id, _, _, m in app.bot.sent:
+            by_chat.setdefault(chat_id, []).append(m)
+        assert all(len(ms) == 2 and all(m.photos for m in ms) for ms in by_chat.values()) and len(by_chat) == 2
+        assert bot.running[-100] == set() and bot.running[-200] == set()
+
+    asyncio.run(run())
+
+
+def test_member_removed_from_group_cannot_submit(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        upd, dm = update("/start", user_id=1, chat_id=1, chat_type="private")
+        await bot.cmd_start(upd, FakeContext(["g-100"], app=ctx.application))
+        ctx.bot.members.discard(1)  # 之后被踢出群
+        dm = await member_submit(bot, ctx)
+        assert "已不是群" in dm.replies[-1][0] and 1 not in bot.dm_targets and bot.api.submitted is None
+
+    asyncio.run(run())
+
+
+def test_scheduled_run_waits_for_manual_run(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1])
+        app = FakeApp()
+        async with bot._auto_lock:
+            waiting = asyncio.ensure_future(bot.run_auto(app, [-100], "🕘", wait_for_lock=True))
+            await asyncio.sleep(0)
+            assert not await bot.run_auto(app, [-100], "manual")  # 手动触发在进行中时不排队
+            assert not waiting.done()
+        assert await waiting and len(bot.api.calls) == 1
+
+    asyncio.run(run())
+
+
+def test_schedule_across_dst_change(tmp_path):
+    bot = make_bot(tmp_path, schedule_times=[(9, 0)], timezone="America/New_York")
+    tz = ZoneInfo("America/New_York")
+    # 2026-11-01 凌晨 2 点夏令时结束：00:30 EDT 到 09:00 EST 实际经过 9.5 小时
+    assert bot.seconds_until_next_run(datetime(2026, 11, 1, 0, 30, tzinfo=tz)) == 9.5 * 3600
+
+
+def test_schedule_defaults_to_nine(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    for k in ("SCHEDULE_TIMES", "SUBSCRIPTIONS_FILE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    assert Config.from_env().schedule_times == [(9, 0)]
+    monkeypatch.setenv("SCHEDULE_TIMES", "")
+    assert Config.from_env().schedule_times == []
+
+
+class YieldingQuery(FakeQuery):
+    async def answer(self, text=None, **kw):
+        await asyncio.sleep(0)  # 让出控制权，模拟真实网络调用期间的并发
+        self.answers.append(text)
+
+
+def test_double_click_submits_once(tmp_path):
+    async def run():
+        # 允许多个并发任务、API 调用会让出控制权：只靠"群忙碌"检查挡不住重复点击
+        bot = make_bot(tmp_path, backend_select=False, max_tasks_per_chat=5)
+        orig = bot.api.submit_task
+
+        async def slow_submit(*a, **kw):
+            await asyncio.sleep(0)
+            return await orig(*a, **kw)
+
+        bot.api.submit_task = slow_submit
+        ctx = FakeContext()
+        await member_submit(bot, ctx)
+        sid = next(iter(bot.selections))
+        q1, q2 = YieldingQuery(f"sel:{sid}:o:0", 1), YieldingQuery(f"sel:{sid}:o:0", 1)
+        await asyncio.gather(bot._on_select(q1, ctx), bot._on_select(q2, ctx))
+        assert len(bot.api.calls) == 1 and bot.quota.used(1) == 1
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_concurrent_menus_cannot_exceed_daily_limit(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, daily_limit=1, max_tasks_per_chat=5, backend_select=False)
+        orig = bot.api.submit_task
+
+        async def slow_submit(*a, **kw):
+            await asyncio.sleep(0)
+            return await orig(*a, **kw)
+
+        bot.api.submit_task = slow_submit
+        ctx = FakeContext()
+        await member_submit(bot, ctx)
+        await member_submit(bot, ctx)
+        sids = list(bot.selections)
+        assert len(sids) == 2
+        await asyncio.gather(*(bot._on_select(YieldingQuery(f"sel:{sid}:o:0", 1), ctx) for sid in sids))
+        assert len(bot.api.calls) == 1 and bot.quota.used(1) == 1
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_failed_submission_refunds_quota_and_slot(tmp_path):
+    from bot.api import APIError
+
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+
+        async def fail(*a, **kw):
+            raise APIError("积分不足")
+
+        bot.api.submit_task = fail
+        dm = await member_submit(bot, FakeContext())
+        assert "提交失败：积分不足" in dm.replies[-1][2].edits[-1][0]
+        assert bot.quota.used(1) == 0 and bot.running[-100] == set()
+
+    asyncio.run(run())
+
+
+# ---------------------------------------------------------------- 第二轮审查发现的问题的回归测试
+
+def alias_bomb(depth=9):
+    lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+    for i in range(1, depth + 1):
+        p = f"*a{i - 1}"
+        lines.append(f"a{i}: &a{i} [{', '.join([p] * 10)}]")
+    lines.append(f"proxies:\n  - {{name: *a{depth}, type: *a{depth}, server: *a{depth}, port: 1}}")
+    return "\n".join(lines)
+
+
+def test_yaml_alias_bomb_is_rejected_quickly():
+    import time as _time
+    from bot.subscription import parse_content, to_api_nodes
+    text = alias_bomb()
+    assert len(text) < 1000
+    started = _time.monotonic()
+    nodes, skipped = to_api_nodes(parse_content(text))
+    assert nodes == [] and skipped == 1 and _time.monotonic() - started < 1
+
+
+def test_many_bomb_sized_nodes_stop_at_total_budget():
+    import time as _time
+    from bot.subscription import MAX_PROXY_ITEMS, to_api_nodes
+    shared = list(range(MAX_PROXY_ITEMS - 20))  # 每个节点都“刚好不超限”
+    proxies = [{"name": f"n{i}", "type": "trojan", "server": "s", "port": 1, "x": shared} for i in range(50_000)]
+    started = _time.monotonic()
+    nodes, skipped = to_api_nodes(proxies, "不存在的关键词")
+    assert nodes == [] and skipped > 0 and _time.monotonic() - started < 5
+
+
+def test_non_scalar_fields_are_skipped():
+    from bot.subscription import to_api_nodes
+    proxies = [{"name": ["x"], "type": "trojan", "server": "s", "port": 1},
+               {"name": "ok", "type": {"t": 1}, "server": "s", "port": 1},
+               {"name": "ok", "type": "trojan", "server": ["s"], "port": 1},
+               {"name": "good", "type": "trojan", "server": "s", "port": 443}]
+    nodes, skipped = to_api_nodes(proxies)
+    assert [n["Name"] for n in nodes] == ["good"] and skipped == 3
+
+
+def test_subscription_urls_capped_and_share_one_deadline(tmp_path, monkeypatch):
+    import bot.main as main_mod
+    fetched = []
+
+    async def fetch(url, **kw):
+        fetched.append(url)
+        await asyncio.sleep(0.03)
+        return [{"name": url[-1], "type": "trojan", "server": "s", "port": 1}]
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+
+    async def run():
+        bot = make_bot(tmp_path)
+        links = " ".join(f"https://a.example/sub{i}" for i in range(10)) + " https://a.example/sub0"
+        dm = await member_submit(bot, FakeContext(), text=links)
+        assert len(fetched) == 5  # 去重并只取前 5 个
+        assert "选择测速后端" in dm.replies[-1][2].edits[-1][0]
+
+        fetched.clear()
+        monkeypatch.setattr(main_mod, "SUB_FETCH_TIMEOUT", 0.05)  # 总超时，不是每个链接各 0.05 秒
+        bot = make_bot(tmp_path)
+        dm = await member_submit(bot, FakeContext(), text=links)
+        # 总超时到了就停止拉取剩余链接；已拿到的节点照常进入下一步
+        assert len(fetched) <= 2 and "节点 1 个" in dm.replies[-1][2].edits[-1][0]
+
+    asyncio.run(run())
+
+
+def test_one_load_at_a_time_per_member(tmp_path, monkeypatch):
+    import bot.main as main_mod
+
+    async def fetch(url, **kw):
+        await asyncio.sleep(0.05)
+        return [{"name": "n", "type": "trojan", "server": "s", "port": 1}]
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        dms = await asyncio.gather(*(member_submit(bot, ctx, text=f"https://a.example/s{i}") for i in range(3)))
+        texts = [dm.replies[-1][0] for dm in dms]
+        assert sum("还在解析中" in t for t in texts) == 2 and len(bot.selections) == 1
+        assert bot._loading == set()
+
+    asyncio.run(run())
+
+
+def test_membership_rechecked_when_submitting(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False)
+        ctx = FakeContext()
+        dm = await member_submit(bot, ctx)
+        sid = next(iter(bot.selections))
+        ctx.bot.members.discard(1)  # 打开菜单后被踢出群
+        await click(bot, f"sel:{sid}:o:0", user_id=1, ctx=ctx)
+        assert "已不是群" in dm.replies[-1][2].edits[-1][0]
+        assert bot.api.submitted is None and bot.quota.used(1) == 0 and bot.running[-100] == set()
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_transient_membership_error_keeps_binding(tmp_path):
+    from telegram.error import TimedOut
+
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        upd, dm = update("/start", user_id=1, chat_id=1, chat_type="private")
+        await bot.cmd_start(upd, FakeContext(["g-100"], app=ctx.application))
+        assert 1 in bot.dm_targets
+
+        async def flaky(chat_id, user_id):
+            raise TimedOut()
+
+        ctx.bot.get_chat_member = flaky
+        dm = await member_submit(bot, ctx)
+        assert "暂时无法确认" in dm.replies[-1][0] and 1 in bot.dm_targets
+
+    asyncio.run(run())
+
+
+def test_ttl_purge_during_loading_does_not_strand_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        msg, ctx = await speed(bot)
+        sid = next(iter(bot.selections))
+        status = msg.replies[-1][2]
+        real_prepare = bot._prepare
+
+        async def prepare_while_purged(sel):
+            bot.selections.pop(sid, None)  # 别人的操作触发了过期清理
+            return await real_prepare(sel)
+
+        bot._prepare = prepare_while_purged
+        await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        assert "选择测速后端" in status.edits[-1][0] and sid in bot.selections
+
+    asyncio.run(run())
+
+
+def test_losing_final_click_keeps_its_menu(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False)
+        ctx = FakeContext()
+        ctx.bot.members.add(3)
+        bot.dm_targets.clear()
+        await member_submit(bot, ctx, user_id=1)
+        await member_submit(bot, ctx, user_id=2)
+        sids = {s.owner.id: sid for sid, s in bot.selections.items()}
+        q1, q2 = YieldingQuery(f"sel:{sids[1]}:o:0", 1), YieldingQuery(f"sel:{sids[2]}:o:0", 2)
+        await asyncio.gather(bot._on_select(q1, ctx), bot._on_select(q2, ctx))
+        assert len(bot.api.calls) == 1
+        loser = 2 if bot.api.submitted[0] and sids[1] not in bot.selections else 1
+        assert sids[loser] in bot.selections and bot.selections[sids[loser]].page == "sort"
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_schedule_in_repeated_fall_back_hour(tmp_path):
+    from datetime import timezone as dt_tz
+    bot = make_bot(tmp_path, schedule_times=[(1, 30)], timezone="America/New_York")
+    # 01:30 EDT 的那次已经跑过，现在是第二个 01:10（EST）：下一次应在明天 01:30，而不是负数立刻重跑
+    now = datetime(2026, 11, 1, 6, 10, tzinfo=dt_tz.utc).astimezone(ZoneInfo("America/New_York"))
+    assert bot.seconds_until_next_run(now) > 20 * 3600
+
+
+# ---------------------------------------------------------------- 第三轮审查发现的问题的回归测试
+
+def test_deeply_nested_yaml_is_rejected_without_crash():
+    from bot.subscription import parse_content
+    for text in ("x: " + "[" * 100_000 + "]" * 100_000,      # 流写法
+                 "x:\n" + "- " * 100_000 + "a",                # 块写法，没有括号
+                 "proxies:\n  - {name: a, type: ss, server: s, port: 1, d: 2020-02-30}"):  # 非法日期
+        assert parse_content(text) == []
+
+
+def test_anchor_chain_depth_and_string_amplification_are_skipped():
+    import time as _time
+    from bot.subscription import parse_content, to_api_nodes
+    chain = ["c0: &c0 x"] + [f"c{i}: &c{i} [[[[[[[[[[*c{i - 1}]]]]]]]]]]" for i in range(1, 41)]
+    chain.append("proxies:\n  - {name: deep, type: ss, server: s, port: 1, evil: *c40}")
+    assert to_api_nodes(parse_content("\n".join(chain))) == ([], 1)
+
+    big = "A" * 1_000_000
+    keys = ", ".join(f"k{i}: *a" for i in range(500))
+    text = f"pad: &a {big}\nproxies:\n  - {{name: amp, type: ss, server: s, port: 1, {keys}}}"
+    started = _time.monotonic()
+    assert to_api_nodes(parse_content(text)) == ([], 1) and _time.monotonic() - started < 10
+
+
+def test_date_names_are_kept():
+    from bot.subscription import parse_content, to_api_nodes
+    nodes, skipped = to_api_nodes(parse_content(
+        "proxies:\n  - {name: 2024-12-31, type: trojan, server: a.example.com, port: 443, password: x}"))
+    assert [n["Name"] for n in nodes] == ["2024-12-31"] and skipped == 0
+
+
+def test_invalid_link_does_not_lose_other_nodes(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path)
+        dm = await member_submit(bot, FakeContext(), text="https://[abc/sub trojan://pw@x.com:443#ok")
+        text = dm.replies[-1][2].edits[-1][0]
+        assert "选择测速后端" in text and "节点 1 个" in text and "链接无效" in text
+
+    asyncio.run(run())
+
+
+def test_warnings_shown_when_some_subscriptions_skipped(tmp_path, monkeypatch):
+    import bot.main as main_mod
+
+    async def fetch(url, **kw):
+        return [{"name": url[-1], "type": "trojan", "server": "s", "port": 1}]
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        await member_submit(bot, ctx, text=" ".join(f"https://a.example/s{i}" for i in range(7)))
+        group_text = ctx.bot.sent[-1][1]
+        assert "节点 5 个" in group_text and "其余已忽略" in group_text
+        await ctx.run_tasks()
+
+    asyncio.run(run())
+
+
+def test_member_stays_blocked_until_abandoned_parse_finishes(tmp_path, monkeypatch):
+    import concurrent.futures
+    import bot.main as main_mod
+
+    pending = concurrent.futures.Future()
+
+    async def fetch(url, on_parse=None, **kw):
+        if on_parse:
+            on_parse(pending)  # 模拟仍在后台线程里跑的解析
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(main_mod, "fetch_subscription", fetch)
+    monkeypatch.setattr(main_mod, "SUB_FETCH_TIMEOUT", 0.02)
+
+    async def run():
+        bot = make_bot(tmp_path)
+        ctx = FakeContext()
+        await member_submit(bot, ctx, text="https://slow.example/a")  # 等待超时返回，但解析线程还在跑
+        dm = await member_submit(bot, ctx, text="https://slow.example/b")
+        assert "还在解析中" in dm.replies[-1][0]
+        pending.set_result([])  # 解析线程结束
+        await asyncio.sleep(0)
+        assert not bot._parsing
+        dm = await member_submit(bot, ctx, text="https://slow.example/c")
+        assert "还在解析中" not in dm.replies[-1][0]
+
+    asyncio.run(run())
+
+
+def test_refund_after_midnight_does_not_touch_new_day(tmp_path):
+    q = DailyQuota(str(tmp_path / "u.json"), 3)
+    q._today = lambda: "2026-10-06"
+    q.consume(1)
+    reserved_day = q.date
+    q._today = lambda: "2026-10-07"  # 提交在 0 点后才失败
+    q.consume(1)  # 新一天已经用过一次
+    q.refund(1, reserved_day)
+    assert q.used(1) == 1  # 不能从新一天的次数里退
+    q.refund(1, q.date)
+    assert q.used(1) == 0

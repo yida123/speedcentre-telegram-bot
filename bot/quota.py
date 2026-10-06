@@ -64,3 +64,16 @@ class DailyQuota:
         self.counts[key] = self.counts.get(key, 0) + 1
         self._save()
         return max(0, self.limit - self.counts[key])
+
+    def refund(self, user_id: int, day: str | None = None) -> None:
+        """退回一次（提交失败时）。day 是扣减时的日期（consume 之后读取 self.date）；
+        如果期间已经跨天，旧的扣减已随换日清零，不能再从新一天的次数里退。"""
+        if self.limit <= 0:
+            return
+        self._roll()
+        if day is not None and day != self.date:
+            return
+        key = str(user_id)
+        if self.counts.get(key, 0) > 0:
+            self.counts[key] -= 1
+            self._save()
