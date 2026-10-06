@@ -972,7 +972,8 @@ class SpeedBot:
             try:
                 share = await self.api.create_share(v.task_id, v.label)
                 if share and share.get("uuid"):
-                    url = self.cfg.share_url.replace("{uuid}", share["uuid"])
+                    # 网页分享页使用去掉横杠的 32 位 ID，例如 share?share_id=bddb13a7…75f01
+                    url = self.cfg.share_url.replace("{uuid}", str(share["uuid"]).replace("-", ""))
             except APIError as e:
                 log.info("创建任务 %s 的分享失败：%s", v.task_id, e)
         url = url or self._task_url(v.task_id)

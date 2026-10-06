@@ -93,7 +93,7 @@ class FakeAPI:
 
     async def create_share(self, task_id, title, hide_private_info=True):
         self.shared = (task_id, title, hide_private_info)
-        return {"uuid": "share-1"}
+        return {"uuid": "5e1f0c2a-0000-4000-8000-00000000abcd"}
 
 
 class FakeBot:
@@ -203,7 +203,8 @@ def test_admin_full_flow_pick_sub_backend_sort(tmp_path):
         assert bot.api.sort == "avg_speed_desc"
         caption = status.photos[0]
         assert "✅ 任务 <b>3399</b> 已完成" in caption and "<a>u9</a>" in caption and "今日剩余" not in caption
-        assert status.photo_markups[0].inline_keyboard[0][0].url == "https://scp.example/share/share-1"
+        assert status.photo_markups[0].inline_keyboard[0][0].url == \
+            "https://scp.example/share/" + "5e1f0c2a-0000-4000-8000-00000000abcd".replace("-", "")
         assert bot.quota.used(ADMIN) == 0 and bot.running[-100] == set()
 
     asyncio.run(run())
@@ -965,3 +966,25 @@ def test_default_configs_match_official_example():
                                 "android-studio-ide-183.5522156-windows.exe")
     assert c["pingAddress"] == "https://cp.cloudflare.com/generate_204"
     assert c["stunURL"] == "udp://stunserver2025.stunprotocol.org:3478"
+
+
+def test_share_link_uses_web_share_page(tmp_path, monkeypatch):
+    async def run():
+        bot = make_bot(tmp_path, subscriptions=SUBS[:1])  # 默认分享地址
+        async def share(task_id, title, hide_private_info=True):
+            return {"uuid": "bddb13a7-1121-4189-820c-1de955d75f01"}
+        bot.api.create_share = share
+        app = FakeApp()
+        await bot.run_auto(app, [-100], "🕘")
+        button = app.bot.sent[0][3].photo_markups[0].inline_keyboard[0][0]
+        assert button.text == "📊 查看详情"
+        assert button.url == "https://web.speedcentre.plus/share?share_id=bddb13a711214189820c1de955d75f01"
+
+    asyncio.run(run())
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    for value, expected in (("", Config.share_url), ("off", ""), ("https://x/s?id={uuid}", "https://x/s?id={uuid}")):
+        monkeypatch.setenv("SCP_SHARE_URL", value)
+        assert Config.from_env().share_url == expected

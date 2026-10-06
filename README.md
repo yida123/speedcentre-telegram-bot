@@ -142,7 +142,8 @@ python -m bot.main
 - `BACKEND_SELECT` / `SORT_SELECT`：是否让用户选择后端 / 排序方式（默认 true；关闭时用默认后端、按平均速度降序）
 - `MAX_TASKS_PER_CHAT`：每个群同时运行的测速任务数（自动测速不受限制）
 - `SCP_TASK_URL`：网页查看任务的链接模板，如 `https://网页地址/tasks/{task_id}`，配置后进度消息显示「在 SpeedCentre+ 查看」
-- `SCP_SHARE_URL`：分享页链接模板，如 `https://网页地址/share/{uuid}`，配置后结果自动创建分享（隐藏节点地址等敏感信息）并显示「查看详情」
+- `SCP_SHARE_URL`：测速完成后自动创建公开分享（隐藏节点地址等敏感信息），结果图下显示「📊 查看详情」。
+  默认 `https://web.speedcentre.plus/share?share_id={uuid}`，填 `off` 关闭
 - 测速配置：`SPEED_DOWNLOAD_URL`、`SPEED_DURATION`（默认 8 秒）、`SPEED_THREADS`（默认 4）、`PING_URL`、
   `PING_AVERAGE_OVER`（默认 3）、`STUN_URL`、`TASK_RETRY`（默认 3）、`DNS_SERVERS`。默认值与
   [SpeedCentre+ 官方对接示例](https://scx.gitbook.io/sc/scp-docs/speedcentre+-copilot-shi-yong)一致。每次提交测速都会带上完整配置——

@@ -43,6 +43,14 @@ def load_subscriptions(path: str) -> list[tuple[str, str]]:
     return subs
 
 
+def _share_url(value: str) -> str:
+    """空值使用默认分享页地址，off/none/false 表示不创建分享。"""
+    value = value.strip()
+    if value.lower() in ("off", "none", "false", "0"):
+        return ""
+    return value or Config.share_url
+
+
 def _str_list(value: str) -> list[str]:
     return [x for x in value.replace(" ", "").split(",") if x]
 
@@ -82,7 +90,8 @@ class Config:
     backend_select: bool = True
     sort_select: bool = True
     task_url: str = ""
-    share_url: str = ""
+    # 分享页链接模板，{uuid} 替换为分享 ID（去掉横杠的 32 位十六进制）；off 表示不创建分享
+    share_url: str = "https://web.speedcentre.plus/share?share_id={uuid}"
     delete_sub_message: bool = True
     sub_link_pattern: str = ""
     poll_interval: float = 5.0
@@ -144,7 +153,7 @@ class Config:
             backend_select=_bool(os.environ.get("BACKEND_SELECT", "true")),
             sort_select=_bool(os.environ.get("SORT_SELECT", "true")),
             task_url=os.environ.get("SCP_TASK_URL", ""),
-            share_url=os.environ.get("SCP_SHARE_URL", ""),
+            share_url=_share_url(os.environ.get("SCP_SHARE_URL", "")),
             delete_sub_message=_bool(os.environ.get("DELETE_SUB_MESSAGE", "true")),
             sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),
