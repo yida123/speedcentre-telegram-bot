@@ -886,7 +886,8 @@ class SpeedBot:
             await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
             task_name = f"{sel.label} · 测速 · {user.full_name if user else '自动测速'}"[:128]
             try:
-                data = await self.api.submit_task(task_name, sel.nodes, list(SPEED_PLAN.matrices), slave_id=sel.slave)
+                data = await self.api.submit_task(task_name, sel.nodes, list(SPEED_PLAN.matrices),
+                                                  self.cfg.task_configs(), slave_id=sel.slave)
                 task_id = (data or {}).get("task_id")
                 if not task_id:
                     raise APIError("API 未返回任务 ID")

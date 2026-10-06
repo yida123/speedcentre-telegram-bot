@@ -76,8 +76,8 @@ class FakeAPI:
             {"client_id": "PRIV", "display_name": "私有", "is_online": True, "allow_public_access": False},
         ]
 
-    async def submit_task(self, name, nodes, matrices, slave_id=None):
-        self.submitted, self.slave_id = (name, nodes, matrices), slave_id
+    async def submit_task(self, name, nodes, matrices, configs, slave_id=None):
+        self.submitted, self.slave_id, self.configs = (name, nodes, matrices), slave_id, configs
         self.calls.append(name)
         return {"task_id": TASK_ID, "status": "pending"}
 
@@ -898,3 +898,59 @@ def test_refund_after_midnight_does_not_touch_new_day(tmp_path):
     assert q.used(1) == 1  # 不能从新一天的次数里退
     q.refund(1, q.date)
     assert q.used(1) == 0
+
+
+# ---------------------------------------------------------------- 始终发送完整的测速配置
+
+CONFIG_KEYS = {"Scripts", "dnsServers", "downloadDuration", "downloadThreading", "downloadURL", "pingAddress",
+               "pingAverageOver", "stunURL", "taskRetry", "tracerouteMaxHops", "tracerouteProbesPerHop",
+               "tracerouteTimeout"}
+
+
+def test_every_submission_sends_full_configs(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, backend_select=False, sort_select=False)
+        ctx = FakeContext()
+        await member_submit(bot, ctx)  # 群员私聊
+        assert set(bot.api.configs) == CONFIG_KEYS
+        assert bot.api.configs["downloadDuration"] > 0 and bot.api.configs["downloadThreading"] > 0
+        assert bot.api.configs["downloadURL"].startswith("https://")
+        await ctx.run_tasks()
+
+        bot.api.configs = None
+        await bot.run_auto(FakeApp(), [-100], "🕘")  # 自动测速
+        assert set(bot.api.configs) == CONFIG_KEYS
+
+    asyncio.run(run())
+
+
+def test_task_configs_from_env(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_BOT_TOKEN", "t")
+    monkeypatch.setenv("SCP_API_KEY", "k")
+    monkeypatch.setenv("SPEED_DURATION", "12")
+    monkeypatch.setenv("SPEED_THREADS", "")  # 空值使用默认
+    monkeypatch.setenv("DNS_SERVERS", "1.1.1.1, 8.8.8.8")
+    configs = Config.from_env().task_configs()
+    assert configs["downloadDuration"] == 12 and configs["downloadThreading"] == Config.speed_threads
+    assert configs["dnsServers"] == ["1.1.1.1", "8.8.8.8"]
+
+
+def test_api_client_always_sends_configs():
+    import httpx
+    from bot.api import SCPClient
+
+    seen = {}
+
+    def handler(req):
+        import json as _json
+        seen.update(_json.loads(req.content))
+        return httpx.Response(201, json={"code": 0, "message": "ok", "data": {"task_id": "t"}})
+
+    async def run():
+        c = SCPClient("k", "https://x")
+        c._client = httpx.AsyncClient(base_url="https://x", transport=httpx.MockTransport(handler))
+        await c.submit_task("n", [], [], {"downloadDuration": 8})
+        assert seen["configs"] == {"downloadDuration": 8}
+
+    asyncio.run(run())

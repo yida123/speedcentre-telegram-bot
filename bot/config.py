@@ -43,6 +43,10 @@ def load_subscriptions(path: str) -> list[tuple[str, str]]:
     return subs
 
 
+def _str_list(value: str) -> list[str]:
+    return [x for x in value.replace(" ", "").split(",") if x]
+
+
 def parse_times(value: str) -> list[tuple[int, int]]:
     """解析 "09:00,21:30" 形式的每日时间点。"""
     times = []
@@ -83,6 +87,32 @@ class Config:
     sub_link_pattern: str = ""
     poll_interval: float = 5.0
     task_timeout: float = 1800.0
+    # 测速配置（提交任务时的 configs，同 miaospeed 的 SlaveRequestConfigs）
+    speed_download_url: str = "https://dl.google.com/dl/android/studio/install/3.4.1.0/android-studio-ide-183.5522156-windows.exe"
+    speed_duration: int = 8
+    speed_threads: int = 4
+    ping_url: str = "https://www.gstatic.com/generate_204"
+    ping_average_over: int = 3
+    stun_url: str = "udp://stun.msl.la:3478"
+    task_retry: int = 3
+    dns_servers: list[str] = field(default_factory=list)
+
+    def task_configs(self) -> dict:
+        """提交测速任务时的完整 configs。后端当前在省略 configs 时会异常断连，所以每次都带上全部字段。"""
+        return {
+            "Scripts": [],
+            "dnsServers": list(self.dns_servers),
+            "downloadDuration": self.speed_duration,
+            "downloadThreading": self.speed_threads,
+            "downloadURL": self.speed_download_url,
+            "pingAddress": self.ping_url,
+            "pingAverageOver": self.ping_average_over,
+            "stunURL": self.stun_url,
+            "taskRetry": self.task_retry,
+            "tracerouteMaxHops": 30,
+            "tracerouteProbesPerHop": 3,
+            "tracerouteTimeout": 0,
+        }
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -118,4 +148,12 @@ class Config:
             sub_link_pattern=os.environ.get("SUB_LINK_PATTERN", ""),
             poll_interval=float(os.environ.get("POLL_INTERVAL", "5")),
             task_timeout=float(os.environ.get("TASK_TIMEOUT", "1800")),
+            speed_download_url=os.environ.get("SPEED_DOWNLOAD_URL") or cls.speed_download_url,
+            speed_duration=int(os.environ.get("SPEED_DURATION") or cls.speed_duration),
+            speed_threads=int(os.environ.get("SPEED_THREADS") or cls.speed_threads),
+            ping_url=os.environ.get("PING_URL") or cls.ping_url,
+            ping_average_over=int(os.environ.get("PING_AVERAGE_OVER") or cls.ping_average_over),
+            stun_url=os.environ.get("STUN_URL") or cls.stun_url,
+            task_retry=int(os.environ.get("TASK_RETRY") or cls.task_retry),
+            dns_servers=_str_list(os.environ.get("DNS_SERVERS", "")),
         )
