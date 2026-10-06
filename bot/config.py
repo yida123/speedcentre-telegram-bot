@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass, field
 
 import yaml
@@ -26,9 +27,9 @@ def _bool(value: str) -> bool:
 
 
 def load_subscriptions(path: str) -> list[tuple[str, str]]:
-    """读取固定测试的订阅 [(名称, 订阅链接)]。"""
+    """读取本机场固定测速的订阅 [(名称, 订阅链接)]；文件不存在时返回空列表（不启用自动测速）。"""
     if not os.path.isfile(path):
-        raise SystemExit(f"找不到订阅配置文件 {path}（可参考 subscriptions.example.yaml）")
+        return []
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     subs: list[tuple[str, str]] = []
@@ -39,9 +40,20 @@ def load_subscriptions(path: str) -> list[tuple[str, str]]:
         if any(name == n for n, _ in subs):
             raise SystemExit(f"{path} 中订阅名「{name}」重复")
         subs.append((name, url))
-    if not subs:
-        raise SystemExit(f"{path} 中没有配置任何订阅")
     return subs
+
+
+def parse_times(value: str) -> list[tuple[int, int]]:
+    """解析 "09:00,21:30" 形式的每日时间点。"""
+    times = []
+    for item in value.replace(" ", "").split(","):
+        if not item:
+            continue
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})", item)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise SystemExit(f"SCHEDULE_TIMES 中的时间「{item}」格式错误，应为 HH:MM，例如 09:00,21:00")
+        times.append((int(m.group(1)), int(m.group(2))))
+    return sorted(set(times))
 
 
 @dataclass
@@ -51,6 +63,9 @@ class Config:
     api_base: str = "https://api.speedcentre.plus"
     subscriptions: list[tuple[str, str]] = field(default_factory=list)
     daily_limit: int = 3
+    schedule_times: list[tuple[int, int]] = field(default_factory=list)
+    auto_chat_ids: set[int] = field(default_factory=set)
+    auto_slave_id: str = ""
     data_dir: str = "data"
     timezone: str = "Asia/Shanghai"
     allowed_chat_ids: set[int] = field(default_factory=set)
@@ -82,6 +97,9 @@ class Config:
             api_base=os.environ.get("SCP_API_BASE", cls.api_base).rstrip("/"),
             subscriptions=load_subscriptions(os.environ.get("SUBSCRIPTIONS_FILE", "subscriptions.yaml")),
             daily_limit=int(os.environ.get("DAILY_LIMIT", "3")),
+            schedule_times=parse_times(os.environ.get("SCHEDULE_TIMES", "")),
+            auto_chat_ids=_int_set(os.environ.get("AUTO_CHAT_IDS", "")),
+            auto_slave_id=os.environ.get("AUTO_SLAVE_ID", ""),
             data_dir=os.environ.get("DATA_DIR", "data"),
             timezone=os.environ.get("TIMEZONE", "Asia/Shanghai"),
             allowed_chat_ids=_int_set(os.environ.get("ALLOWED_CHAT_IDS", "")),

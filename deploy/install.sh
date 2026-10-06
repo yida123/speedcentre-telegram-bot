@@ -17,6 +17,8 @@ fi
 if [[ "${1:-}" == "--update" ]]; then
     echo ">> 拉取最新代码"
     git -c safe.directory="$APP_DIR" -C "$APP_DIR" pull --ff-only
+    # bash 仍在执行拉取前的旧脚本，改为用拉取后的新脚本继续安装，确保新增的安装步骤生效
+    exec bash "$APP_DIR/deploy/install.sh"
 fi
 
 echo ">> 安装系统依赖"
