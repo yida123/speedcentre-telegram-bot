@@ -392,6 +392,9 @@ class SpeedBot(AdminCommands):
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         q = update.callback_query
         data = q.data or ""
+        if data.startswith("group:"):
+            await self._on_group_select(q, context)
+            return
         if data.startswith("sel:"):
             await self._on_select(q, context)
             return
@@ -406,6 +409,67 @@ class SpeedBot(AdminCommands):
     def _dm_markup(self, bot_username: str, chat_id: int) -> InlineKeyboardMarkup:
         url = f"https://t.me/{bot_username}?start=g{chat_id}"
         return InlineKeyboardMarkup([[InlineKeyboardButton("🔒 私聊发送订阅", url=url)]])
+
+    async def _group_choices(self, bot) -> list[tuple[int, str, str | None]]:
+        """返回授权群的 (ID, 名称, 加群链接)；链接来自公开用户名或 Telegram 已知邀请链接。"""
+        choices = []
+        for chat_id in sorted(self.cfg.allowed_chat_ids):
+            try:
+                chat = await bot.get_chat(chat_id)
+                title = getattr(chat, "title", None) or str(chat_id)
+                username = (getattr(chat, "username", None) or "").lstrip("@")
+                link = f"https://t.me/{username}" if username else getattr(chat, "invite_link", None)
+            except TelegramError:
+                title, link = str(chat_id), None
+            choices.append((chat_id, title, link))
+        return choices
+
+    async def _send_group_picker(self, msg: Message, bot, intro: str = "") -> None:
+        """私聊没有绑定目标群时，列出授权群，避免用户不知道应加入哪个群。"""
+        if not self.cfg.allowed_chat_ids:
+            await self._say(msg, intro + "请先在 Bot 所在的测速群里发送 /speed，再点击私聊按钮。")
+            return
+        choices = await self._group_choices(bot)
+        rows = []
+        for chat_id, title, link in choices:
+            label = f"选择「{title[:30]}」"
+            row = [InlineKeyboardButton(label, callback_data=f"group:{chat_id}")]
+            if link:
+                row.insert(0, InlineKeyboardButton(f"加入「{title[:24]}」", url=link))
+            rows.append(row)
+        text = (intro + "请先加入一个测速群，再点击‘选择此群’。\n\n"
+                "授权群列表：\n" + "\n".join(
+                    f"• <b>{esc(title)}</b> <code>{chat_id}</code>" for chat_id, title, _ in choices))
+        await self._say(msg, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _on_group_select(self, q, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            chat_id = int((q.data or "").split(":", 1)[1])
+        except (IndexError, ValueError):
+            await q.answer("群组选择无效。", show_alert=True)
+            return
+        if not self.group_allowed(chat_id):
+            await q.answer("该群已不在授权名单中。", show_alert=True)
+            return
+        if self.is_banned(q.from_user.id):
+            await q.answer("你已被管理员禁止使用测速。", show_alert=True)
+            return
+        if not self.is_admin(q.from_user.id):
+            member = await self._is_member(context.bot, chat_id, q.from_user.id)
+            if member is None:
+                await q.answer("暂时无法确认群成员身份，请稍后重试。", show_alert=True)
+                return
+            if not member:
+                await q.answer("请先点击‘加入’进入该群，再选择此群。", show_alert=True)
+                return
+        title = await self._chat_title(context.bot, chat_id)
+        self.dm_targets[q.from_user.id] = DMTarget(chat_id, title)
+        await q.answer("已选择此群。")
+        message = getattr(q, "message", None)
+        if message:
+            await message.edit_text(
+                f"好的，测速结果将发送到群「{esc(title)}」。{self._quota_text(q.from_user.id)}\n\n"
+                "请直接发送订阅链接或节点链接。", parse_mode=ParseMode.HTML)
 
     async def _send_dm_prompt(self, msg: Message, user: User, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
                               deleted: bool = False) -> None:
@@ -575,10 +639,13 @@ class SpeedBot(AdminCommands):
         """处理群里「私聊发送订阅」按钮的深链：/start g<群ID>。"""
         msg, user = update.effective_message, update.effective_user
         m = re.fullmatch(r"g(-?\d+)(?:_\w+)?", (context.args or [""])[0])
-        if update.effective_chat.type != ChatType.PRIVATE or not m:
+        if update.effective_chat.type != ChatType.PRIVATE:
             await self.cmd_help(update, context)  # 管理员的命令菜单在这里补设
             return
         await self.ensure_admin_menu(context.bot, user.id)
+        if not m:
+            await self._send_group_picker(msg, context.bot)
+            return
         chat_id = int(m.group(1))
         if not self.group_allowed(chat_id):
             await self._say(msg, "该群未授权使用此 Bot。")
@@ -604,7 +671,10 @@ class SpeedBot(AdminCommands):
     async def on_private_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         if not any(extract_sources(msg.text or "")):
-            await self._say(msg, "请发送订阅链接或节点链接。发送 /help 查看用法。")
+            if not await self._resolve_target(update.effective_user, context.bot):
+                await self._send_group_picker(msg, context.bot)
+            else:
+                await self._say(msg, "请发送订阅链接或节点链接。发送 /help 查看用法。")
             return
         await self._private_speed(update, context, (msg.text or "").split())
 
@@ -629,7 +699,8 @@ class SpeedBot(AdminCommands):
             return
         target = await self._resolve_target(user, context.bot)
         if not target:
-            await self._say(msg, "请先在机场群里发送 /speed，然后点击「🔒 私聊发送订阅」按钮。")
+            await self._send_group_picker(msg, context.bot,
+                                          "还没有选择接收测速结果的群。\n")
             return
         target.updated = time.monotonic()
         rest, name_filter, slave = self._parse_args(args)
@@ -1595,7 +1666,7 @@ def main() -> None:
     for name, _ in USER_COMMANDS + ADMIN_COMMANDS:
         app.add_handler(CommandHandler(name, getattr(bot, f"cmd_{name}")))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, bot.on_private_text))
-    app.add_handler(CallbackQueryHandler(bot.on_callback, pattern=r"^(cancel|sel):"))
+    app.add_handler(CallbackQueryHandler(bot.on_callback, pattern=r"^(cancel|sel|group):"))
     log.info("Bot 启动，本机场订阅：%s，自动测速：%s，授权群组：%s，每日次数：%s",
              "、".join(n for n, _ in cfg.subscriptions) or "无",
              bot.schedule.describe() if bot.schedule else "未启用",

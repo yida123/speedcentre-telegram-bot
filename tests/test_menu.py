@@ -64,7 +64,7 @@ class FakeMessage:
 
 class FakeQuery:
     def __init__(self, data, uid):
-        self.data, self.from_user, self.answers = data, FakeUser(uid), []
+        self.data, self.from_user, self.answers, self.message = data, FakeUser(uid), [], None
 
     async def answer(self, text=None, **kw):
         self.answers.append(text)
@@ -135,7 +135,9 @@ class FakeBot:
         return SimpleNamespace(status="member" if user_id in self.members else "left")
 
     async def get_chat(self, chat_id):
-        return SimpleNamespace(title="测速群")
+        if chat_id == -200:
+            return SimpleNamespace(title="备用测速群", invite_link="https://t.me/+backup-invite")
+        return SimpleNamespace(title="测速群", username="speed_group")
 
 
 class FakeApp:
@@ -309,6 +311,40 @@ def test_start_deep_link_requires_membership(tmp_path):
     asyncio.run(run())
 
 
+def test_private_start_lists_groups_and_join_links(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, allowed_chat_ids={-100, -200})
+        upd, dm = update("/start", user_id=1, chat_id=1, chat_type="private")
+        await bot.cmd_start(upd, FakeContext())
+        text, markup, _ = dm.replies[-1]
+        assert "请先加入一个测速群" in text
+        assert "测速群" in text and "备用测速群" in text
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        assert {button.url for button in buttons if button.url} == {
+            "https://t.me/speed_group", "https://t.me/+backup-invite"
+        }
+        assert {button.callback_data for button in buttons if button.callback_data} == {
+            "group:-100", "group:-200"
+        }
+
+    asyncio.run(run())
+
+
+def test_private_group_picker_binds_selected_group(tmp_path):
+    async def run():
+        bot = make_bot(tmp_path, allowed_chat_ids={-100, -200})
+        upd, dm = update("/start", user_id=1, chat_id=1, chat_type="private")
+        await bot.cmd_start(upd, FakeContext())
+        picker = dm.replies[-1][2]
+        q = FakeQuery("group:-100", 1)
+        q.message = picker
+        await bot.on_callback(SimpleNamespace(callback_query=q), FakeContext())
+        assert bot.dm_targets[1].chat_id == -100
+        assert "测速群" in picker.edits[-1][0]
+
+    asyncio.run(run())
+
+
 async def member_submit(bot, ctx, text="trojan://pw@other.com:443#别家节点", user_id=1):
     upd, dm = update(text, user_id=user_id, chat_id=user_id, chat_type="private")
     await bot.on_private_text(upd, ctx)
@@ -368,14 +404,14 @@ def test_private_without_target_and_non_link_text(tmp_path):
     async def run():
         bot = make_bot(tmp_path, allowed_chat_ids={-100, -200})  # 多个群时必须先点按钮
         dm = await member_submit(bot, FakeContext())
-        assert "点击「🔒 私聊发送订阅」" in dm.replies[-1][0] and not bot.selections
+        assert "请先加入一个测速群" in dm.replies[-1][0] and not bot.selections
 
         bot = make_bot(tmp_path)
         dm = await member_submit(bot, FakeContext(), text="你好")
         assert "请发送订阅链接" in dm.replies[-1][0]
 
         dm = await member_submit(bot, FakeContext(), user_id=3)  # 非群成员
-        assert "点击「🔒 私聊发送订阅」" in dm.replies[-1][0]
+        assert "请先加入一个测速群" in dm.replies[-1][0]
 
     asyncio.run(run())
 

@@ -111,7 +111,7 @@ def test_removed_group_no_longer_receives_member_tests(tmp_path):
         assert bot.dm_targets[1].chat_id == -200
         await command(bot, "group", "/group del -200")
         out = await member_submit(bot, ctx)
-        assert "请先在机场群里发送 /speed" in out.replies[-1][0] and bot.api.submitted is None
+        assert "请先加入一个测速群" in out.replies[-1][0] and bot.api.submitted is None
 
     asyncio.run(run())
 
