@@ -14,6 +14,7 @@ import secrets
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update, User
@@ -28,7 +29,7 @@ from .admin import ADMIN_COMMANDS, USER_COMMANDS, AdminCommands
 from .api import APIError, SCPClient
 from .config import Config
 from .formatter import (
-    PRESETS, build_plan, esc, fmt_duration, format_result_text, format_stats, node_speed, progress_bar,
+    PRESETS, TEST_OPTIONS, TestPlan, build_plan, esc, fmt_duration, format_result_text, format_stats, node_speed, progress_bar,
 )
 from .quota import DailyQuota
 from .schedule import Schedule, ScheduleError, parse_schedule
@@ -48,18 +49,19 @@ UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 SELECTION_TTL = 600  # 选择菜单的有效期（秒）
 DM_TARGET_TTL = 1800  # 私聊绑定的目标群有效期（秒）
 BACKENDS_PER_PAGE = 5
+SCRIPTS_PER_PAGE = 8
 NOTICE_TTL = 120  # 群内引导消息自动删除时间（秒）
 SUB_FETCH_TIMEOUT = 60  # 拉取一次提交中所有订阅的总超时（秒），防止慢速服务器拖住 bot
 MAX_SUB_URLS = 5  # 一次最多拉取的订阅链接数
 MAX_FILTER_LEN = 64
 MEMBER_LABEL = "群友订阅"  # 群成员私聊提交的订阅在群里显示的名称
-SPEED_PLAN = build_plan(PRESETS["speed"].title, PRESETS["speed"].options)
 # 结果图排序方式（按钮文字, export 的 sort 参数；空字符串为订阅原顺序）
 SORTS = [
     ("📋 订阅顺序（默认）", ""),
     ("🀄 节点名（升序）", "name_asc"),
     ("🚀 平均速度（升序）", "avg_speed_asc"),
     ("🚀 平均速度（降序）", "avg_speed_desc"),
+    ("⏱ RTT（升序）", "rtt_asc"),
 ]
 
 
@@ -76,7 +78,7 @@ class DMTarget:
 
 @dataclass
 class Selection:
-    """测速提交前的选择状态（订阅 → 后端 → 排序）。"""
+    """测试提交前的选择状态（订阅 → 测试内容 → 后端 → 排序）。"""
     owner: User | None  # None 表示每日自动测速
     chat_id: int  # 进度和结果发往的群
     status: Message  # 菜单所在的消息（群里或私聊）
@@ -90,7 +92,13 @@ class Selection:
     slave_name: str | None = None
     backends: list[dict] = field(default_factory=list)  # 可选后端快照
     backend_page: int = 0
-    sort: str | None = None  # None 表示未选择（使用平均速度降序）
+    sort: str | None = None  # None 表示未选择（按测试项目决定默认排序）
+    options: set[str] = field(default_factory=lambda: set(PRESETS["speed"].options))
+    tests_confirmed: bool = False
+    scripts: list[dict] | None = None  # 全局脚本快照，仅含 id/name/type
+    script_ids: set[str] = field(default_factory=set)
+    script_page: int = 0
+    script_error: str = ""
     warnings: str = ""  # 部分订阅失败或被跳过时的提示
     airport: bool = False  # 管理员测速本机场订阅（只有管理员可以提交）
     page: str = "subs"
@@ -99,6 +107,22 @@ class Selection:
     @property
     def label(self) -> str:
         return self.sub[0] if self.sub else "-"
+
+    @property
+    def test_summary(self) -> str:
+        labels = [label for key, (label, _) in TEST_OPTIONS.items() if key in self.options]
+        labels += [s.get("name") or s["id"] for s in self.scripts or [] if s["id"] in self.script_ids]
+        return "、".join(labels) or "未选择"
+
+    @property
+    def plan(self) -> TestPlan:
+        title = "测速" if self.options == set(PRESETS["speed"].options) and not self.script_ids else self.test_summary
+        ids = tuple(s["id"] for s in self.scripts or [] if s["id"] in self.script_ids)
+        return build_plan(title, self.options, ids)
+
+    @property
+    def sort_choices(self) -> list[int]:
+        return [0, 1] + ([2, 3] if "speed" in self.options else [4] if "rtt" in self.options else [])
 
 
 @dataclass
@@ -110,6 +134,7 @@ class TaskView:
     backend: str  # 选择的后端（自动选择时由任务状态中的 slave_name 覆盖）
     sort: str | None
     auto: bool = False  # 本机场自动测速（异常时提醒管理员）
+    views: tuple[str, ...] = ("normalview",)
 
 
 @dataclass
@@ -137,7 +162,7 @@ class ResultPost:
 HELP_TEXT = """<b>机场节点测速 Bot</b>
 
 <b>测自己的订阅</b>：在群里发送 <code>/speed</code>，点击「🔒 私聊发送订阅」，在私聊里发送订阅链接，
-选择测试后端和排序方式后开始，测速进度和结果图会发回群里并 @ 你。{quota}
+选择测试内容（可多选测速、延迟、拓扑、流媒体等）、后端和排序后开始，进度和结果图会发回群里并 @ 你。{quota}
 为防止泄露，群里出现的订阅链接会被自动删除。
 
 <b>本机场节点状态</b>：{schedule}管理员可发送 <code>/speed</code> 或 <code>/autotest</code> 手动测速。
@@ -181,6 +206,7 @@ class SpeedBot(AdminCommands):
         self._loading: set[int] = set()  # 正在解析订阅的群成员，每人同时只能有一个
         self._parsing: dict[int, int] = {}  # 群成员仍在后台线程里跑的解析数（超时后线程不会停，跑完才算结束）
         self._timers: dict[asyncio.Task, Message] = {}  # 待执行的定时删除 -> 要删除的消息
+        self._edit_locks: WeakValueDictionary[tuple[int, int], asyncio.Lock] = WeakValueDictionary()
 
     # ------------------------------------------------------------ 群消息自动删除
 
@@ -741,11 +767,13 @@ class SpeedBot(AdminCommands):
         return error is None
 
     def _advance(self, sid: str, sel: Selection) -> bool:
-        """决定下一步：需要选后端/排序时切换页面并返回 False；可以提交时移除菜单并返回 True。
+        """决定下一步：需要选内容/后端/排序时切换页面并返回 False；可以提交时移除菜单并返回 True。
         这里不 await，保证同一菜单被并发点击时只会提交一次。"""
-        if self.cfg.backend_select and not sel.slave_arg and len(sel.backends) > 1 and sel.page != "sort":
+        if sel.owner is not None and not sel.tests_confirmed:
+            sel.page = "tests"
+        elif self.cfg.backend_select and not sel.slave_arg and len(sel.backends) > 1 and sel.page != "sort":
             sel.page = "backends"
-        elif self.cfg.sort_select and sel.sort is None:
+        elif self.cfg.sort_select and sel.sort is None and "normalview" in sel.plan.views:
             sel.page = "sort"
         else:
             self.selections.pop(sid, None)
@@ -757,7 +785,7 @@ class SpeedBot(AdminCommands):
         return False
 
     async def _next_step(self, sid: str, sel: Selection, application: Application) -> None:
-        """节点就绪后：按需选后端 → 选排序 → 提交。"""
+        """节点就绪后：选测试内容 → 按需选后端 → 选排序 → 提交。"""
         if self._advance(sid, sel):
             await self._submit(sel, application)
         else:
@@ -933,13 +961,19 @@ class SpeedBot(AdminCommands):
         return self._backends[1]
 
     def _backend_allowed(self, b: dict) -> bool:
-        if b.get("allow_public_access") is False:
+        if not b.get("client_id") or b.get("allow_public_access") is False or b.get("locked") or b.get("upgrade_required"):
             return False
         return not self.cfg.allowed_backends or b.get("client_id") in self.cfg.allowed_backends
 
-    async def _selectable_backends(self) -> list[dict]:
-        """可选后端：在线、允许 Copilot 调用、在 ALLOWED_BACKENDS 内，保持 API 返回的顺序。"""
-        return [b for b in await self._all_backends() if b.get("is_online") and self._backend_allowed(b)]
+    async def _selectable_backends(self, refresh: bool = False) -> list[dict]:
+        """可选后端：在线、未锁定、无需升级且有调用权限，保持 API 返回的顺序。
+        提交时刷新列表，查询失败直接报错，不用旧缓存分配任务。"""
+        if refresh:
+            backends = await self.api.list_backends()
+            self._backends = (time.monotonic(), backends)
+        else:
+            backends = await self._all_backends()
+        return [b for b in backends if b.get("is_online") and self._backend_allowed(b)]
 
     @staticmethod
     def _match_backend(backends: list[dict], key: str) -> dict | None:
@@ -956,6 +990,10 @@ class SpeedBot(AdminCommands):
         return name if name == cid else f"{name} ({cid})"
 
     async def _render_menu(self, sid: str, sel: Selection) -> None:
+        # 按钮应答期间可能已提交、取消或过期，不能再用旧菜单覆盖进度消息。
+        if self.selections.get(sid) is not sel or sel.page not in {"subs", "tests", "scripts", "backends", "sort"}:
+            return
+
         def btn(label: str, action: str) -> InlineKeyboardButton:
             return InlineKeyboardButton(label, callback_data=f"sel:{sid}:{action}")
 
@@ -965,6 +1003,36 @@ class SpeedBot(AdminCommands):
             text = f"📋 <b>选择要测速的订阅</b> · {who}"
             buttons = [btn(name[:30], f"u:{n}") for n, (name, _) in enumerate(self.cfg.subscriptions)]
             rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        elif sel.page == "tests":
+            text = (f"🧪 <b>选择测试内容（可多选）</b> · {who}\n\n"
+                    f"任务：<b>{esc(sel.label)}</b>\n节点 {len(sel.nodes)} 个\n"
+                    f"已选：{esc(sel.test_summary[:800])}\n点击项目勾选或取消，确认后继续。")
+            buttons = [btn(f"{'✅' if key in sel.options else '⬜'} {label}", f"t:{key}")
+                       for key, (label, _) in TEST_OPTIONS.items()]
+            rows += [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+            rows.append([btn(f"🎬 流媒体 / 脚本（已选 {len(sel.script_ids)} 项）", "scripts")])
+            rows.append([btn("清空选择", "clear"), btn("✅ 确认测试内容", "go")])
+        elif sel.page == "scripts":
+            text = (f"🎬 <b>选择流媒体 / 检测脚本（可多选）</b> · {who}\n\n"
+                    f"已选 {len(sel.script_ids)} 项，点击脚本勾选或取消。")
+            scripts = sel.scripts or []
+            if sel.script_error:
+                text += f"\n⚠️ 获取流媒体脚本失败：{esc(sel.script_error[:300])}\n返回后可重试。"
+            elif not scripts:
+                text += "\n后端暂无可用流媒体脚本，可返回选择其他测试项目。"
+            pages = max(1, -(-len(scripts) // SCRIPTS_PER_PAGE))
+            sel.script_page = min(sel.script_page, pages - 1)
+            start = sel.script_page * SCRIPTS_PER_PAGE
+            for n, s in enumerate(scripts[start:start + SCRIPTS_PER_PAGE], start):
+                mark = "✅" if s["id"] in sel.script_ids else "⬜"
+                rows.append([btn(f"{mark} {(s.get('name') or s['id'])[:45]}", f"s:{n}")])
+            if pages > 1:
+                rows.append([
+                    btn("上一页", f"sp:{sel.script_page - 1}") if sel.script_page > 0 else btn("·", "noop"),
+                    btn(f"{sel.script_page + 1}/{pages}", "noop"),
+                    btn("下一页", f"sp:{sel.script_page + 1}") if sel.script_page < pages - 1 else btn("·", "noop"),
+                ])
+            rows.append([btn("返回测试内容", "back")])
         elif sel.page == "backends":
             text = f"🖥 <b>选择测速后端</b> · {who}\n\n任务：<b>{esc(sel.label)}</b>\n节点 {len(sel.nodes)} 个"
             pages = max(1, -(-len(sel.backends) // BACKENDS_PER_PAGE))
@@ -983,9 +1051,10 @@ class SpeedBot(AdminCommands):
         else:  # sort
             text = (f"📊 <b>选择排序方式</b> · {who}\n\n"
                     f"订阅名：<b>{esc(sel.label)}</b>\n选中后端：<b>{esc(sel.slave or '自动选择')}</b>")
-            buttons = [btn(label, f"o:{n}") for n, (label, _) in enumerate(SORTS)]
+            text += f"\n测试内容：{esc(sel.test_summary[:800])}"
+            buttons = [btn(SORTS[n][0], f"o:{n}") for n in sel.sort_choices]
             rows += [buttons[:1], buttons[1:2], buttons[2:]]
-        if sel.warnings and sel.page in ("backends", "sort"):
+        if sel.warnings and sel.page != "subs":
             text += f"\n⚠️ {esc(sel.warnings)}"
         if sel.chat_id != sel.status.chat_id and sel.page != "subs":
             text += f"\n结果将发送到群「{esc(sel.chat_title)}」"
@@ -1035,10 +1104,48 @@ class SpeedBot(AdminCommands):
             await q.answer()
             await self._render_menu(sid, sel)
             return
+        if kind == "scripts" and sel.page == "tests":
+            sel.page = "loading_scripts"
+            await q.answer()
+            if sel.scripts is None:
+                try:
+                    scripts = await self.api.list_scripts()
+                    # 全局脚本只有元数据，由 API 解析 INTERNAL:: 引用；不能当作源码传入 configs.Scripts。
+                    sel.scripts = list({s["id"]: s for s in scripts
+                                        if s.get("type") == "media" and s.get("id")}.values())
+                    sel.script_error = ""
+                except APIError as e:
+                    sel.script_error = str(e)
+            if self.selections.get(sid) is not sel or sel.page != "loading_scripts":
+                return  # 加载期间被取消或过期，不恢复菜单
+            sel.page = "scripts"
+            await self._render_menu(sid, sel)
+            return
+        if ((sel.page == "tests" and (kind == "clear" or kind == "t" and arg in TEST_OPTIONS))
+                or (sel.page == "scripts" and (kind == "back" or kind == "sp" and idx >= 0
+                                               or kind == "s" and 0 <= idx < len(sel.scripts or [])))):
+            if kind == "clear":
+                sel.options.clear()
+                sel.script_ids.clear()
+            elif kind == "t":
+                sel.options.symmetric_difference_update({arg})
+            elif kind == "s":
+                sel.script_ids.symmetric_difference_update({sel.scripts[idx]["id"]})
+            elif kind == "sp":
+                sel.script_page = idx
+            else:
+                sel.page = "tests"
+            await q.answer()
+            await self._render_menu(sid, sel)
+            return
         valid = ((kind == "b" and sel.page == "backends" and (arg == "auto" or 0 <= idx < len(sel.backends)))
-                 or (kind == "o" and sel.page == "sort" and 0 <= idx < len(SORTS)))
+                 or (kind == "o" and sel.page == "sort" and idx in sel.sort_choices)
+                 or (kind == "go" and sel.page == "tests"))
         if not valid:
             await q.answer()
+            return
+        if kind == "go" and not sel.plan.matrices:
+            await q.answer("请至少选择一个测试项目或流媒体脚本。", show_alert=True)
             return
         # 先检查再修改，忙碌或冷却中时菜单保持原样，稍后可以再点
         if self._busy(sel.chat_id):
@@ -1047,7 +1154,9 @@ class SpeedBot(AdminCommands):
         if self._cooldown_left(sel.owner.id):
             await q.answer(self._cooldown_text(sel.owner.id), show_alert=True)
             return
-        if kind == "b":
+        if kind == "go":
+            sel.tests_confirmed = True
+        elif kind == "b":
             if arg == "auto":
                 sel.slave = sel.slave_name = None
             else:
@@ -1125,14 +1234,23 @@ class SpeedBot(AdminCommands):
                     self.expire(status)
                     return []
             await self._edit(status, f"🚀 任务 <b>{esc(sel.label)}</b> 正在提交…")
-            task_name = f"{sel.label} · 测速 · {user.full_name if user else '自动测速'}"[:128]
+            plan = sel.plan
+            task_name = f"{sel.label} · {plan.title} · {user.full_name if user else '自动测速'}"[:128]
             try:
-                data = await self.api.submit_task(task_name, sel.nodes, list(SPEED_PLAN.matrices),
+                if not sel.slave:
+                    # 省略 slave_id 时 API 会返回 failed to get slave information；由 Bot 明确选择。
+                    backends = await self._selectable_backends(refresh=True)
+                    if not backends:
+                        raise APIError("暂无可用测速后端，请稍后再试或检查后端权限设置")
+                    chosen = backends[0]
+                    sel.slave, sel.slave_name = chosen["client_id"], chosen.get("display_name")
+                data = await self.api.submit_task(task_name, sel.nodes, list(plan.matrices),
                                                   self.cfg.task_configs(), slave_id=sel.slave)
                 task_id = (data or {}).get("task_id")
                 if not task_id:
                     raise APIError("API 未返回任务 ID")
             except APIError as e:
+                log.warning("提交测速失败 backend=%s status=%s code=%s：%s", sel.slave, e.status, e.code, e)
                 if member:
                     refund()
                 for m in (status, *mirrors):
@@ -1158,6 +1276,7 @@ class SpeedBot(AdminCommands):
             except APIError as e:
                 log.warning("取消任务 %s 失败：%s", task_id, e)
         info = f"{who} · 节点 {len(sel.nodes)} 个"
+        info += f"\n测试内容：{esc(sel.test_summary[:800])}"
         if sel.name_filter:
             info += f" · 过滤 <code>{esc(sel.name_filter)}</code>"
         if remaining is not None:
@@ -1165,8 +1284,9 @@ class SpeedBot(AdminCommands):
         if sel.warnings:
             info += f"\n⚠️ {esc(sel.warnings)}"
         info += f"\nID <code>{task_id}</code>"
-        sort = "avg_speed_desc" if sel.sort is None else (sel.sort or None)
-        view = TaskView(task_id, sel.label, info, sel.slave_name or sel.slave or "自动选择", sort, auto=user is None)
+        sort = plan.sort if sel.sort is None else (sel.sort or None)
+        view = TaskView(task_id, sel.label, info, sel.slave_name or sel.slave or "自动选择", sort,
+                        auto=user is None, views=plan.views)
 
         if sel.chat_id != status.chat_id:
             # 私聊提交：进度和结果发到群里并 @ 发起人
@@ -1187,14 +1307,19 @@ class SpeedBot(AdminCommands):
         return []
 
     async def _edit(self, msg: Message, text: str, markup=None) -> None:
-        try:
-            await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
-                                disable_web_page_preview=True)
-        except BadRequest as e:
-            if "not modified" not in str(e).lower():
+        # 同一消息的编辑按发起顺序发送，避免慢菜单请求晚于提交/取消提示生效。
+        # 弱引用让最后一个编辑完成后自动释放锁，不积累历史消息。
+        key = (msg.chat_id, msg.message_id)
+        lock = self._edit_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            try:
+                await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=markup,
+                                    disable_web_page_preview=True)
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    log.warning("编辑消息失败：%s", e)
+            except TelegramError as e:
                 log.warning("编辑消息失败：%s", e)
-        except TelegramError as e:
-            log.warning("编辑消息失败：%s", e)
 
     @staticmethod
     def _task_text(v: TaskView, status: str, done: int = 0, total: int = 0, backend: str | None = None,
@@ -1290,7 +1415,8 @@ class SpeedBot(AdminCommands):
             done, posted, entries = statuses, [], []
             if st == "completed":
                 # 只删除结果已发出的进度消息；发送失败时保留摘要（含任务 ID，可用 /result 查看）
-                result = await self._send_result(statuses, v.task_id, v.sort, summary, await self._share_markup(v))
+                result = await self._send_result(statuses, v.task_id, v.sort, summary, await self._share_markup(v),
+                                                 views=v.views)
                 done, posted, entries = result.targets, result.messages, result.entries
             # 结果图（含同样的摘要）已发出，进度消息完成使命；失败/取消的提示同样按时删除
             for m in done:
@@ -1341,8 +1467,9 @@ class SpeedBot(AdminCommands):
                 f"（提醒阈值 {percent}%）\n{names}\nID <code>{v.task_id}</code>")
 
     async def _send_result(self, targets: Message | list[Message], task_id: str, sort: str | None, header: str,
-                           markup: InlineKeyboardMarkup | None = None) -> ResultPost:
-        """把结果图（导不出图时为文字结果）发到每个目标消息下面；结果和图片只获取一次。"""
+                           markup: InlineKeyboardMarkup | None = None,
+                           views: tuple[str, ...] | None = None) -> ResultPost:
+        """按测试内容发送结果视图；/result 从结果矩阵推断视图，导图失败时用对应的文字结果。"""
         targets = targets if isinstance(targets, list) else [targets]
         entries: list[dict] = []
         try:
@@ -1353,24 +1480,48 @@ class SpeedBot(AdminCommands):
 
         stats = format_stats(entries) if entries else ""
         caption = f"{header}\n{stats}".strip()[:1000]
-        try:
-            image = await self.api.export_image(task_id, "normalview", sort)
-        except APIError as e:
-            log.info("导出任务 %s 结果图失败：%s", task_id, e)
-            image = None
+        geo_types = {"GEOIP_INBOUND", "GEOIP_OUTBOUND"}
+        if views is None:
+            types = {m.get("Type") for e in entries for m in e.get("Matrices") or []}
+            views = (("normalview",) if not types or types - geo_types else ())
+            if types & geo_types:
+                views += ("topologyview",)
+        exports = []
+        for view in views:
+            try:
+                image = await self.api.export_image(task_id, view, sort if view == "normalview" else None)
+            except APIError as e:
+                log.info("导出任务 %s 的 %s 结果图失败：%s", task_id, view, e)
+                image = None
+            # 多视图时，文字兜底只显示当前视图的矩阵，避免重复整份结果。
+            view_entries = []
+            for entry in entries:
+                matrices = [m for m in entry.get("Matrices") or []
+                            if (m.get("Type") in geo_types) == (view == "topologyview")]
+                if matrices:
+                    view_entries.append({**entry, "Matrices": matrices})
+            exports.append((view, image, view_entries if len(views) > 1 else entries))
         post = ResultPost([], [], entries)
         for reply_to in targets:
-            try:
-                ok, sent = await self._send_result_to(reply_to, task_id, image, entries, caption, markup)
-            except TelegramError as e:
-                log.warning("向 %s 发送任务 %s 结果失败：%s", reply_to.chat_id, task_id, e)
-                continue
-            if ok:
+            complete = True
+            for view, image, view_entries in exports:
+                view_caption = caption
+                if len(views) > 1:
+                    view_caption += "\n" + ("出入口拓扑" if view == "topologyview" else "测试结果")
+                try:
+                    ok, sent = await self._send_result_to(reply_to, task_id, image, view_entries, view_caption, markup)
+                except TelegramError as e:
+                    log.warning("向 %s 发送任务 %s 的 %s 结果失败：%s", reply_to.chat_id, task_id, view, e)
+                    complete = False
+                    continue
+                if ok:
+                    if sent is not None:
+                        post.messages.append(sent)
+                else:
+                    complete = False
+                    self.expire(sent)  # “无法获取结果。”只是提示，不是测试结果
+            if complete:
                 post.targets.append(reply_to)
-                if sent is not None:
-                    post.messages.append(sent)
-            else:
-                self.expire(sent)  # “无法获取结果。”只是提示，不是测速结果
         return post
 
     @staticmethod

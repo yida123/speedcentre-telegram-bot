@@ -138,6 +138,8 @@ def format_result_text(entries: list[dict], limit: int = 40) -> str:
             parts.append(f"RTT {fmt_ms(m['TEST_PING_RTT'].get('Value'))}")
         if "TEST_PING_CONN" in m:
             parts.append(f"HTTPS {fmt_ms(m['TEST_PING_CONN'].get('Value'))}")
+        if "TEST_HTTP_CODE" in m:
+            parts.append(f"HTTP {m['TEST_HTTP_CODE'].get('Value') or '-'}")
         if "TEST_PING_PACKET_LOSS" in m:
             parts.append(f"丢包 {m['TEST_PING_PACKET_LOSS'].get('Value', 0):.1f}%")
         if "SPEED_AVERAGE" in m:
@@ -167,15 +169,17 @@ def format_stats(entries: list[dict]) -> str:
     """一行统计：可用节点数、最快节点等。"""
     total = len(entries)
     alive, best_name, best_speed = 0, None, 0
+    has_latency = False
     for e in entries:
         m = summarize_entry(e)
+        has_latency |= "TEST_PING_RTT" in m or "TEST_PING_CONN" in m
         rtt = (m.get("TEST_PING_RTT") or {}).get("Value") or (m.get("TEST_PING_CONN") or {}).get("Value")
         if rtt:
             alive += 1
         speed = (m.get("SPEED_AVERAGE") or {}).get("Value") or 0
         if speed > best_speed:
             best_speed, best_name = speed, (e.get("ProxyInfo") or {}).get("Name")
-    s = f"可用 {alive}/{total}"
+    s = f"可用 {alive}/{total}" if has_latency else f"测试节点 {total} 个"
     if best_name:
         s += f"，最快：{esc(best_name)}（{fmt_speed(best_speed)}）"
     return s
