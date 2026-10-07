@@ -1,6 +1,6 @@
-# speed_bot
+# SpeedCentre+ Telegram 订阅测速 Bot
 
-基于 [SpeedCentre+ 用户 API](https://api.speedcentre.plus) 的 Telegram 群组测速 Bot。
+基于 [SpeedCentre+ 用户 API](https://api.speedcentre.plus) 的 Telegram 订阅测速机器人，支持延迟、速度、丢包、拓扑和流媒体测试。
 
 | 谁 | 测什么 | 怎么触发 | 结果 | 次数 |
 | --- | --- | --- | --- | --- |
@@ -120,8 +120,7 @@ subscriptions:
 
 ```bash
 sudo apt update && sudo apt install -y git
-sudo git clone https://github.com/yida123/speed_bot.git /opt/speed_bot
-# 私有仓库：用 https://<用户名>:<token>@github.com/yida123/speed_bot.git，或配置 deploy key
+sudo git clone https://github.com/yida123/speedcentre-telegram-bot.git /opt/speed_bot
 sudo bash /opt/speed_bot/deploy/install.sh
 ```
 
