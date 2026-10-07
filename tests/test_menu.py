@@ -187,6 +187,7 @@ async def speed(bot, text="/speed", user_id=ADMIN, ctx=None):
     upd, msg = update(text, user_id)
     ctx = ctx or FakeContext(text.split()[1:])
     await bot.cmd_speed(upd, ctx)
+    await confirm_default_tests(bot, msg, user_id, ctx)
     return msg, ctx
 
 
@@ -194,6 +195,15 @@ async def click(bot, data, user_id=ADMIN, ctx=None):
     q = FakeQuery(data, user_id)
     await bot._on_select(q, ctx or FakeContext())
     return q
+
+
+async def confirm_default_tests(bot, msg, user_id, ctx):
+    """旧流程测试继续用默认测速项目；新项目选择测试直接操作真实菜单。"""
+    if msg.replies:
+        status = msg.replies[-1][2]
+        for sid, sel in list(bot.selections.items()):
+            if sel.status is status and sel.page == "tests":
+                await click(bot, f"sel:{sid}:go", user_id=user_id, ctx=ctx)
 
 
 # ---------------------------------------------------------------- 管理员测本机场订阅
@@ -208,6 +218,8 @@ def test_admin_full_flow_pick_sub_backend_sort(tmp_path):
         sid = next(iter(bot.selections))
 
         await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        assert "选择测试内容" in status.edits[-1][0] and bot.api.submitted is None
+        await click(bot, f"sel:{sid}:go", ctx=ctx)
         text, markup = status.edits[-1]
         assert "选择测速后端" in text and "任务：<b>3399</b>" in text
         assert buttons(markup) == ["🤖 自动选择", "上海电信@2Gbps (SHCT)", "东莞电信@1Gbps (DGCT)", "❌ 终止操作"]
@@ -239,7 +251,7 @@ def test_admin_named_sub_without_pickers(tmp_path):
     async def run():
         bot = make_bot(tmp_path, backend_select=False, sort_select=False)
         _, ctx = await speed(bot, "/speed iplc")  # 订阅名不区分大小写
-        assert bot.api.submitted[0].startswith("IPLC · 测速") and bot.api.slave_id is None
+        assert bot.api.submitted[0].startswith("IPLC · 测速") and bot.api.slave_id == "SHCT"
         await ctx.run_tasks()
         assert bot.api.sort == "avg_speed_desc"
 
@@ -300,6 +312,7 @@ def test_start_deep_link_requires_membership(tmp_path):
 async def member_submit(bot, ctx, text="trojan://pw@other.com:443#别家节点", user_id=1):
     upd, dm = update(text, user_id=user_id, chat_id=user_id, chat_type="private")
     await bot.on_private_text(upd, ctx)
+    await confirm_default_tests(bot, dm, user_id, ctx)
     return dm
 
 
@@ -649,9 +662,11 @@ def test_failed_submission_refunds_quota_and_slot(tmp_path):
             raise APIError("积分不足")
 
         bot.api.submit_task = fail
-        dm = await member_submit(bot, FakeContext())
+        ctx = FakeContext()
+        dm = await member_submit(bot, ctx)
         assert "提交失败：积分不足" in dm.replies[-1][2].edits[-1][0]
         assert bot.quota.used(1) == 0 and bot.running[-100] == set()
+        await ctx.run_tasks()
 
     asyncio.run(run())
 
@@ -794,6 +809,8 @@ def test_ttl_purge_during_loading_does_not_strand_menu(tmp_path):
 
         bot._prepare = prepare_while_purged
         await click(bot, f"sel:{sid}:u:0", ctx=ctx)
+        assert "选择测试内容" in status.edits[-1][0] and sid in bot.selections
+        await click(bot, f"sel:{sid}:go", ctx=ctx)
         assert "选择测速后端" in status.edits[-1][0] and sid in bot.selections
 
     asyncio.run(run())

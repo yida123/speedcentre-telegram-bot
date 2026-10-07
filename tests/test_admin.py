@@ -319,8 +319,10 @@ def test_failed_submission_does_not_start_cooldown(tmp_path):
             raise APIError("积分不足")
 
         bot.api.submit_task = fail
-        await member_submit(bot, FakeContext())
+        ctx = FakeContext()
+        await member_submit(bot, ctx)
         assert 1 not in bot.last_test and bot._cooldown_left(1) == 0
+        await ctx.run_tasks()
 
     asyncio.run(run())
 
